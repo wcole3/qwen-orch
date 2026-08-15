@@ -1,0 +1,4 @@
+settings/
+upstream/
+.venv/
+.vscode/
