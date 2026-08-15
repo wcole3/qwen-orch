@@ -20,7 +20,13 @@ echo "Preflight for model: $MODEL_KEY"
 
 # 1. Binary
 if [[ -x "$LLAMA_SERVER" ]] && "$LLAMA_SERVER" --version >/dev/null 2>&1; then
-  build="$("$LLAMA_SERVER" --version 2>&1 | sed -n 's/^version: \([0-9]*\).*/\1/p')"
+  # New format: "version: 0.1.0-dev (build 10448, commit ad1de39e0)" — build number is
+  # in the parens. Old format: "version: 10014 (00fa7cb28)" — build number is the leading
+  # int. Try new first; only the matching branch replaces the pattern space so old lines
+  # fall through untouched.
+  build="$("$LLAMA_SERVER" --version 2>&1 | sed -n \
+    -e 's/^version: .*(build \([0-9]*\).*/\1/p' \
+    -e 's/^version: \([0-9]*\).*/\1/p')"
   note "✓" "llama-server: $LLAMA_SERVER (build ${build:-unknown})"
   if [[ "$MIN_BUILD" -gt 0 && "${build:-0}" -lt "$MIN_BUILD" ]]; then
     note "✗" "build ${build:-unknown} is too old for $MODEL_KEY (needs >= b$MIN_BUILD)."
@@ -73,11 +79,25 @@ else
   note "⚠" "nvidia-smi not found — cannot verify GPU/VRAM."
 fi
 
-# 4. Port
-if command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | grep -q ":$PORT "; then
-  note "⚠" "port $PORT is already in use — run.sh will pkill the existing llama-server first."
+# 4. Port. Advisory only — run.sh is what actually refuses to launch. If the
+# holder is a llama-server from this build, run.sh stops it and carries on; if
+# it is anything else, run.sh fails loudly rather than let llama-server die on
+# a raw bind error. Name the holder here when ss can see it.
+if command -v ss >/dev/null 2>&1; then
+  PORT_ROWS="$(ss -ltnp 2>/dev/null | awk -v port=":$PORT" '$1 == "LISTEN" && $4 ~ (port "$") {print}')"
+  if [[ -n "$PORT_ROWS" ]]; then
+    PORT_PID="$(printf '%s\n' "$PORT_ROWS" | grep -oE 'pid=[0-9]+' | head -n1 | cut -d= -f2)"
+    PORT_NAME="$(printf '%s\n' "$PORT_ROWS" | grep -oE '"[^"]+"' | head -n1 | tr -d '"')"
+    if [[ -n "$PORT_PID" ]]; then
+      note "⚠" "port $PORT is in use by pid $PORT_PID (${PORT_NAME:-unknown}) — run.sh stops it if it is a llama-server from this build, else it fails loudly."
+    else
+      note "⚠" "port $PORT is in use by another user's process (pid hidden — needs root to see) — run.sh will fail loudly rather than launch."
+    fi
+  else
+    note "✓" "port $PORT is free"
+  fi
 else
-  note "✓" "port $PORT is free"
+  note "⚠" "ss not found — cannot check port $PORT in advance; run.sh still refuses a foreign holder at launch."
 fi
 
 echo
