@@ -202,9 +202,52 @@ downloaded.
 --effort L              reasoning_effort: low|medium|xhigh   (Qwen3.8 only)
 --no-vision             skip --mmproj on a vision model, serve text-only
 --port P                listen port           (default 8081)
+--ngl N                 layers offloaded to GPU              (default 99 = all)
+--parallel N            server slots                    (default: llama-server)
+--slot-save-path DIR    where slot KV state is saved    (default: llama-server)
+--cache-reuse N         prompt-prefix cache reuse chunk (default: llama-server)
+--lora PATH             load a LoRA adapter, repeatable
 --save-defaults         persist this launch's flags as the model's defaults
 --reset-defaults        delete the saved defaults and exit
 ```
+
+### Serving several clients: `--parallel`
+
+`--parallel N` gives llama-server N slots, so N requests are served
+concurrently. The context is **split between them** — `--ctx 262144 --parallel
+2` is 131,072 tokens per slot, not 262,144 — so raise `--ctx` if each client
+needs the full window and you have the VRAM for it.
+
+`--slot-save-path DIR` lets the server persist a slot's KV cache to disk (the
+directory is created for you), and `--cache-reuse N` sets how much of a prompt
+prefix it will reuse from cache via KV shifting. Both are llama-server features
+passed straight through; unset means llama-server's own default, so nothing
+changes unless you ask for it.
+
+### LoRA adapters
+
+`--lora PATH` is repeatable and implies `--lora-init-without-apply`: adapters
+are loaded but start **inactive**, and a client attaches the ones it wants
+per request through the server's API. Requests that ask for nothing run on
+clean base weights, which is what you want when some of your traffic (tool
+calls, structured output) must not be nudged by a style adapter.
+
+### Port conflicts
+
+If the port is held by a `llama-server` from the same build, `run.sh` stops it,
+waits for it to unbind (up to 30s — a big model takes a while to release its
+VRAM), and launches. If it is held by anything else, `run.sh` names the holder
+and refuses, rather than letting llama-server die on a raw bind error after it
+has already started loading weights:
+
+```
+FAIL: port 8081 is already in use
+      held by pid 4412 (node)
+      Stop it, or serve elsewhere: ./run.sh q8 --port <other>
+```
+
+The pid is hidden when the holder belongs to another user; the refusal is the
+same. `preflight.sh` reports the same information up front as a warning.
 
 ### Per-model defaults
 
