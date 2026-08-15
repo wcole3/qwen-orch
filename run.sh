@@ -23,6 +23,9 @@
 # overrides the composed flags) — for YaRN, --image-min-tokens, sampler tweaks.
 # Word-split: values containing spaces are not supported.
 set -euo pipefail
+# Remember where the caller stood before we cd: --slot-save-path and --lora take
+# paths, and a relative one means "relative to my cwd", not to this script's dir.
+CALLER_PWD="$PWD"
 cd "$(dirname "$0")"
 source ./env.sh
 
@@ -57,6 +60,17 @@ flags:
   --no-vision             skip --mmproj for a vision model — text-only, frees
                           the projector's VRAM (no effect on text-only models)
   --port P                listen port (default $PORT)
+  --ngl N                 layers offloaded to GPU (default 99 = all)
+
+ server-tuning passthroughs (unset = llama-server's own default):
+  --parallel N            server slots. Note each slot gets ctx/N tokens, so
+                          --parallel 2 halves the per-slot context
+  --slot-save-path DIR    where slot KV state is saved (created if missing;
+                          a relative path resolves against your cwd)
+  --cache-reuse N         min chunk size reused from the prompt-prefix cache
+  --lora PATH             load a LoRA adapter, repeatable. Implies
+                          --lora-init-without-apply: adapters load inactive and
+                          are attached per-request via the server's API
   --save-defaults         persist the effective flags of this launch to
                           settings/<model>.conf (used automatically next time)
   --reset-defaults        delete settings/<model>.conf and exit
@@ -94,6 +108,14 @@ EFFORT=""           # empty = don't pass reasoning_effort at all
 VISION=1
 PORT_BASE="$PORT"   # --save-defaults only persists --port if it changed
 SAVE_DEFAULTS=0
+NGL=99
+# Server-tuning passthroughs. Empty = don't pass the flag at all, so
+# llama-server's own default applies and this script stays opinion-free about
+# slots, KV persistence and cache reuse.
+PARALLEL=""
+SLOT_SAVE_PATH=""
+CACHE_REUSE=""
+LORAS=()
 
 MMPROJ="$(model_mmproj_path "$MODEL_KEY")"   # empty for text-only models
 TEMP_THINK="$(model_info "$MODEL_KEY" temp)" # thinking-mode default for this model
@@ -123,6 +145,11 @@ while [[ $# -gt 0 ]]; do
     --no-preserve-thinking) PRESERVE=0; shift ;;
     --no-vision) VISION=0; shift ;;
     --port) PORT="${2:?--port needs a value}"; shift 2 ;;
+    --ngl) NGL="${2:?--ngl needs a value}"; shift 2 ;;
+    --parallel) PARALLEL="${2:?--parallel needs a value}"; shift 2 ;;
+    --slot-save-path) SLOT_SAVE_PATH="${2:?--slot-save-path needs a path}"; shift 2 ;;
+    --cache-reuse) CACHE_REUSE="${2:?--cache-reuse needs a value}"; shift 2 ;;
+    --lora) LORAS+=("${2:?--lora needs a path}"); shift 2 ;;
     --save-defaults) SAVE_DEFAULTS=1; shift ;;
     --reset-defaults)
       rm -f "$SETTINGS_DIR/$MODEL_KEY.conf"
@@ -161,6 +188,26 @@ if [[ -n "$EFFORT" ]]; then
   esac
 fi
 
+# Numeric passthroughs: catch a typo here, not as a llama-server usage error
+# thirty seconds into loading the weights.
+for _pair in "ngl:$NGL" "parallel:$PARALLEL" "cache-reuse:$CACHE_REUSE"; do
+  _name="${_pair%%:*}"; _val="${_pair#*:}"
+  if [[ -n "$_val" && ! "$_val" =~ ^[0-9]+$ ]]; then
+    echo "--$_name must be a non-negative integer (got: $_val)" >&2; exit 1
+  fi
+done
+unset _pair _name _val
+
+# A relative --slot-save-path is relative to the caller's cwd; this script has
+# already cd'd to its own directory, so resolve it before anything (the save
+# below, llama-server itself) can read it as scripts-dir-relative.
+if [[ -n "$SLOT_SAVE_PATH" ]]; then
+  case "$SLOT_SAVE_PATH" in
+    /*) ;;
+    *) SLOT_SAVE_PATH="$CALLER_PWD/$SLOT_SAVE_PATH" ;;
+  esac
+fi
+
 # ── Save defaults ────────────────────────────────────────────────────────────
 # Reconstructed from the effective state, NOT the raw CLI: the settings file
 # REPLACES the table's args on the next launch, so it must carry everything
@@ -177,6 +224,13 @@ if (( SAVE_DEFAULTS )); then
   if (( PRESERVE == 0 ));    then SAVED+=(--no-preserve-thinking); fi
   if (( VISION == 0 ));      then SAVED+=(--no-vision); fi
   if [[ "$PORT" != "$PORT_BASE" ]]; then SAVED+=(--port "$PORT"); fi
+  if (( NGL != 99 ));        then SAVED+=(--ngl "$NGL"); fi
+  if [[ -n "$PARALLEL" ]];   then SAVED+=(--parallel "$PARALLEL"); fi
+  if [[ -n "$CACHE_REUSE" ]]; then SAVED+=(--cache-reuse "$CACHE_REUSE"); fi
+  # Already absolute by here, so the saved line means the same thing next time
+  # no matter which directory that launch is started from.
+  if [[ -n "$SLOT_SAVE_PATH" ]]; then SAVED+=(--slot-save-path "$SLOT_SAVE_PATH"); fi
+  for _lora in "${LORAS[@]-}"; do [[ -n "$_lora" ]] && SAVED+=(--lora "$_lora"); done
   mkdir -p "$SETTINGS_DIR"
   printf '%s\n' "${SAVED[*]-}" > "$SETTINGS_DIR/$MODEL_KEY.conf"
   echo "saved defaults for $MODEL_KEY: ${SAVED[*]-(none)}"
@@ -185,11 +239,27 @@ fi
 # ── Compose the server command ───────────────────────────────────────────────
 ARGS=(
   -m "$MODEL_PATH"
-  -ngl 99
+  -ngl "$NGL"
   --jinja
   -fa on
   -c "$CTX"
 )
+
+[[ -n "$PARALLEL" ]] && ARGS+=(--parallel "$PARALLEL")
+[[ -n "$CACHE_REUSE" ]] && ARGS+=(--cache-reuse "$CACHE_REUSE")
+# llama-server does not create the slot directory itself — it fails at startup
+# if it is missing.
+if [[ -n "$SLOT_SAVE_PATH" ]]; then
+  mkdir -p "$SLOT_SAVE_PATH"
+  ARGS+=(--slot-save-path "$SLOT_SAVE_PATH")
+fi
+
+# Adapters load inactive: --lora-init-without-apply lets a client attach them
+# per-request, so requests that need the base weights are unaffected.
+if (( ${#LORAS[@]} )); then
+  ARGS+=(--lora-init-without-apply)
+  for _lora in "${LORAS[@]}"; do ARGS+=(--lora "$_lora"); done
+fi
 
 [[ "$KV" != f16 ]] && ARGS+=(-ctk "$KV" -ctv "$KV")
 
