@@ -317,12 +317,26 @@ if [[ "${SKIP_PREFLIGHT:-0}" != "1" ]]; then
   ./preflight.sh "$MODEL_KEY"
 fi
 
+# port_holder — the raw `ss` LISTEN row(s) for $PORT, or empty if free. Scans
+# ALL matching rows, not just the first: on a dual-stack or SO_REUSEPORT port
+# whose first row has an empty Process field but a later row carries a pid,
+# reporting "hidden" off the first row alone would be wrong. Matched by port
+# only, not by host: a process on 0.0.0.0:$PORT still collides with a bind on
+# $HOST:$PORT. No early `exit` in the awk action — awk must drain ss's stdout
+# or ss takes SIGPIPE, and under `set -o pipefail` the command substitution
+# then fails and `set -e` kills this script silently, on exactly the path whose
+# job is to print the failure below.
+port_holder() {
+  command -v ss >/dev/null 2>&1 || return 0
+  ss -ltnp 2>/dev/null | awk -v port=":$PORT" '$1 == "LISTEN" && $4 ~ (port "$") {print}' || true
+}
+
 # Stop any llama-server already running from this build. Matched on each PID's
 # real executable, not on its command line: `pkill -f "$LLAMA_SERVER"` also
 # matches any *other* process that merely mentions the path — a shell that
 # exported it, an editor, this script's own parent — and kills it.
 stop_running_server() {
-  local target pid exe stopped=0
+  local target pid exe stopped=0 waited_ms=0 announced=0
   target="$(readlink -f "$LLAMA_SERVER" 2>/dev/null)" || return 0
   [[ -z "$target" ]] && return 0
   for pid in $(pgrep -x "${LLAMA_SERVER##*/}" 2>/dev/null); do
@@ -330,10 +344,44 @@ stop_running_server() {
     [[ "$exe" == "$target" ]] || continue
     kill "$pid" 2>/dev/null && stopped=1
   done
-  (( stopped )) && { echo "stopped a running llama-server"; sleep 2; }
+  (( stopped )) || return 0
+  echo "stopped a running llama-server"
+  # A server holding tens of GB of weights routinely needs longer than a fixed
+  # couple of seconds to free its VRAM and unbind. Poll, so a slow-but-fine
+  # shutdown is not misreported below as a foreign process squatting the port.
+  while [[ -n "$(port_holder)" ]]; do
+    (( waited_ms >= 30000 )) && break
+    if (( ! announced )) && (( waited_ms >= 1000 )); then
+      echo "waiting for it to release port $PORT..."
+      announced=1
+    fi
+    sleep 0.5
+    waited_ms=$(( waited_ms + 500 ))
+  done
   return 0
 }
 stop_running_server
+
+# Anything still LISTENing on the port belongs to someone else. Say so here,
+# instead of letting llama-server die a few lines down on a raw bind error
+# after it has already started loading.
+CONFLICT="$(port_holder)"
+if [[ -n "$CONFLICT" ]]; then
+  # ss prints users:(("name",pid=NNNN,fd=N)) when the process is visible (same
+  # user, or root) and leaves the field empty otherwise. Take the first pid and
+  # first quoted name found across all matching rows; only fall back to the
+  # hidden-pid wording when no row yields a pid at all.
+  CONFLICT_PID="$(printf '%s\n' "$CONFLICT" | grep -oE 'pid=[0-9]+' | head -n1 | cut -d= -f2)"
+  CONFLICT_NAME="$(printf '%s\n' "$CONFLICT" | grep -oE '"[^"]+"' | head -n1 | tr -d '"')"
+  echo "FAIL: port $PORT is already in use" >&2
+  if [[ -n "$CONFLICT_PID" ]]; then
+    echo "      held by pid $CONFLICT_PID (${CONFLICT_NAME:-unknown})" >&2
+  else
+    echo "      held by another user's process (pid hidden — needs root to see)" >&2
+  fi
+  echo "      Stop it, or serve elsewhere: ./run.sh $MODEL_KEY --port <other>" >&2
+  exit 1
+fi
 
 echo
 VISION_STATE=n/a

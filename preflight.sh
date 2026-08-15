@@ -73,11 +73,25 @@ else
   note "⚠" "nvidia-smi not found — cannot verify GPU/VRAM."
 fi
 
-# 4. Port
-if command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | grep -q ":$PORT "; then
-  note "⚠" "port $PORT is already in use — run.sh will pkill the existing llama-server first."
+# 4. Port. Advisory only — run.sh is what actually refuses to launch. If the
+# holder is a llama-server from this build, run.sh stops it and carries on; if
+# it is anything else, run.sh fails loudly rather than let llama-server die on
+# a raw bind error. Name the holder here when ss can see it.
+if command -v ss >/dev/null 2>&1; then
+  PORT_ROWS="$(ss -ltnp 2>/dev/null | awk -v port=":$PORT" '$1 == "LISTEN" && $4 ~ (port "$") {print}')"
+  if [[ -n "$PORT_ROWS" ]]; then
+    PORT_PID="$(printf '%s\n' "$PORT_ROWS" | grep -oE 'pid=[0-9]+' | head -n1 | cut -d= -f2)"
+    PORT_NAME="$(printf '%s\n' "$PORT_ROWS" | grep -oE '"[^"]+"' | head -n1 | tr -d '"')"
+    if [[ -n "$PORT_PID" ]]; then
+      note "⚠" "port $PORT is in use by pid $PORT_PID (${PORT_NAME:-unknown}) — run.sh stops it if it is a llama-server from this build, else it fails loudly."
+    else
+      note "⚠" "port $PORT is in use by another user's process (pid hidden — needs root to see) — run.sh will fail loudly rather than launch."
+    fi
+  else
+    note "✓" "port $PORT is free"
+  fi
 else
-  note "✓" "port $PORT is free"
+  note "⚠" "ss not found — cannot check port $PORT in advance; run.sh still refuses a foreign holder at launch."
 fi
 
 echo
