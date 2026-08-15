@@ -20,7 +20,13 @@ echo "Preflight for model: $MODEL_KEY"
 
 # 1. Binary
 if [[ -x "$LLAMA_SERVER" ]] && "$LLAMA_SERVER" --version >/dev/null 2>&1; then
-  build="$("$LLAMA_SERVER" --version 2>&1 | sed -n 's/^version: \([0-9]*\).*/\1/p')"
+  # New format: "version: 0.1.0-dev (build 10448, commit ad1de39e0)" — build number is
+  # in the parens. Old format: "version: 10014 (00fa7cb28)" — build number is the leading
+  # int. Try new first; only the matching branch replaces the pattern space so old lines
+  # fall through untouched.
+  build="$("$LLAMA_SERVER" --version 2>&1 | sed -n \
+    -e 's/^version: .*(build \([0-9]*\).*/\1/p' \
+    -e 's/^version: \([0-9]*\).*/\1/p')"
   note "✓" "llama-server: $LLAMA_SERVER (build ${build:-unknown})"
   if [[ "$MIN_BUILD" -gt 0 && "${build:-0}" -lt "$MIN_BUILD" ]]; then
     note "✗" "build ${build:-unknown} is too old for $MODEL_KEY (needs >= b$MIN_BUILD)."
