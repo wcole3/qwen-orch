@@ -39,6 +39,22 @@ PORT="${PORT:-8081}"
 
 export LLAMA_MAINLINE LLAMA_SERVER MODELS_DIR SETTINGS_DIR HOST PORT
 
+# ── SGLang (Docker) ─────────────────────────────────────────────────
+# Used by run-sglang.sh only — the llama.cpp path above is unaffected. The
+# image ships its own SGLang build, so nothing is installed on the host.
+# SGLANG_PORT is the port *inside* the container; run-sglang.sh --port changes
+# only what is published on the host, so the two can differ.
+SGLANG_IMAGE="${SGLANG_IMAGE:-lmsysorg/sglang:qwen38-27b}"
+SGLANG_PORT="${SGLANG_PORT:-30000}"
+SGLANG_CONTAINER="${SGLANG_CONTAINER:-qwen38-sglang}"
+
+# The SGLang container resolves its weights from a HuggingFace repo id, not from
+# $MODELS_DIR — they land in this cache on first launch. ./fetch-models.sh
+# serves the llama.cpp path and is not a prerequisite for run-sglang.sh.
+HF_CACHE="${HF_CACHE:-$HOME/.cache/huggingface}"
+
+export SGLANG_IMAGE SGLANG_PORT SGLANG_CONTAINER HF_CACHE
+
 # ── Model table ──────────────────────────────────────────────────────────────
 # model_info <key> <field>
 #   fields: repo | file | mmproj | path | fmt | minbuild | size | disk | vram |
@@ -69,7 +85,7 @@ export LLAMA_MAINLINE LLAMA_SERVER MODELS_DIR SETTINGS_DIR HOST PORT
 # GGUF path invariant: path == $MODELS_DIR/<repo basename>/<file> — fetch-models.sh
 # computes its download dest from repo, and its skip/verify checks from path.
 MODEL_KEYS=(nvfp4 nvfp4-attn q8 bf16 hauhau huihui aeon deckard nvfp4-unsloth
-            38-q8 38-bf16)
+            38-q8 38-bf16 38-nvfp4)
 
 model_info() {
   local key="$1" field="$2"
@@ -175,6 +191,18 @@ model_info() {
       size="55 GB"; disk=51; vram=76000; temp=1.0   # extrapolated from 38-q8 by weight delta
       args=""
       desc="Qwen3.8 BF16 + vision, MTP baked in — full precision reference" ;;
+    # Served by ./run-sglang.sh, not ./run.sh: NVFP4 W4A4 is a safetensors
+    # checkpoint that llama.cpp cannot load. The SGLang container pulls it into
+    # $HF_CACHE from the repo id on first launch, so `./fetch-models.sh 38-nvfp4`
+    # is optional — it only puts a second copy under $MODELS_DIR.
+    38-nvfp4)
+      repo=RadixArk/Qwen3.8-27B-NVFP4
+      file='*'
+      path="$MODELS_DIR/Qwen3.8-27B-NVFP4"
+      fmt=safetensors; minbuild=0
+      size="17 GB"; disk=16; vram=0; temp=1.0
+      args=""
+      desc="Qwen3.8 NVFP4 W4A4 + FP8 KV — SGLang docker, ./run-sglang.sh" ;;
     *) return 1 ;;
   esac
   case "$field" in
@@ -247,7 +275,7 @@ model_list() {
       args="$(head -n1 "$SETTINGS_DIR/$key.conf")"; marker=" [saved]"
     fi
     if [[ "$fmt" != gguf ]]; then
-      marker="$marker [vLLM only]"
+      marker="$marker [vLLM/SGLang]"
     fi
     mmproj="$(model_mmproj_path "$key")"
     if [[ -n "$mmproj" ]]; then

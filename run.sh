@@ -79,7 +79,11 @@ MODEL_PATH="$(model_info "$MODEL_KEY" path)"
 
 if [[ "$(model_info "$MODEL_KEY" fmt)" != gguf ]]; then
   echo "$MODEL_KEY is a safetensors checkpoint — llama.cpp cannot load it." >&2
-  echo "Serve it with vLLM instead:  vllm serve $MODEL_PATH" >&2
+  if [[ "$MODEL_KEY" == 38-nvfp4 ]]; then
+    echo "Serve it with SGLang instead:  ./run-sglang.sh" >&2
+  else
+    echo "Serve it with vLLM instead:  vllm serve $MODEL_PATH" >&2
+  fi
   exit 1
 fi
 

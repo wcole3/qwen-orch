@@ -1,8 +1,9 @@
-# Run Qwen locally with llama.cpp
+# Run Qwen locally with llama.cpp or SGLang
 
-Two scripts to download **Qwen3.6-27B** and **Qwen3.8-27B** (plus a few
-community finetunes up to 40B) and serve them on your own GPU, behind an
-OpenAI-compatible API, tuned for **precise coding**.
+A handful of scripts to download **Qwen3.6-27B** and **Qwen3.8-27B** (plus a
+few community finetunes up to 40B) and serve them on your own GPU, behind an
+OpenAI-compatible API, tuned for **precise coding**. GGUF goes through
+llama.cpp; the NVFP4 safetensors checkpoint goes through SGLang in Docker.
 
 The point is that one command gets you a working server. Every model in the
 table launches with settings that already match its own recommendations —
@@ -30,6 +31,11 @@ Qwen3.6 keys are unprefixed (`q8`, `bf16`, …); Qwen3.8 keys are prefixed `38-`
 ./fetch-models.sh 38-q8    # Qwen3.8-27B + vision — 29 GB + 0.9 GB projector
 ./run.sh 38-q8             # serves text, images and video
 ./run.sh --list            # every model: disk, VRAM, defaults
+```
+
+```bash
+docker pull lmsysorg/sglang:qwen38-27b
+./run-sglang.sh            # Qwen3.8-27B NVFP4 under SGLang, http://0.0.0.0:30000/v1
 ```
 
 Point any OpenAI-compatible client at `http://localhost:8081/v1`:
@@ -77,6 +83,7 @@ overhead.
 | `nvfp4-unsloth` | 23 GB | 22 GiB | — | [official unsloth NVFP4](https://huggingface.co/unsloth/Qwen3.6-27B-NVFP4), **safetensors — vLLM/SGLang only**. `run.sh` refuses it; serve with `vllm serve ~/models/Qwen3.6-27B-NVFP4`. No unsloth NVFP4 *GGUF* exists, and safetensors→GGUF NVFP4 conversion is [known-flaky](https://github.com/ggml-org/llama.cpp/discussions/23627). |
 | `38-q8` | 29 GB + 0.9 | 27 GiB + 1 | 51 GB‡ | **Qwen3.8-27B**, [unsloth GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) `Q8_0` + `mmproj-F16` — vision-language, MTP baked in. |
 | `38-bf16` | 55 GB + 0.9 | 51 GiB + 1 | 76 GB | Same repo, BF16 split GGUF + the same projector — full-precision reference. |
+| `38-nvfp4` | 17 GB | —§ | — | [RadixArk NVFP4](https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4), **safetensors — SGLang only**. `run.sh` refuses it; serve with [`./run-sglang.sh`](#run-sglangsh-sglang-in-docker). W4A4 + FP8 projections, ~16.5 GB of weights, and the checkpoint declares FP8 KV. |
 
 \* at each model's *own* defaults (262k context, f16 KV unless its `args` say
 otherwise). Smaller `--ctx` or `--kv q8_0` shrinks it a lot — see
@@ -87,6 +94,9 @@ from it by the weight delta.
 
 The `+ 0.9` / `+ 1` on the Qwen3.8 rows is the shared vision projector. Both
 keys live in one directory, so it is downloaded once and counted once.
+
+§ `38-nvfp4` is pulled by the SGLang container into `~/.cache/huggingface`, not
+`$MODELS_DIR`, so `./fetch-models.sh` is not part of its path.
 
 ### Qwen3.8 vs Qwen3.6
 
@@ -299,6 +309,166 @@ python3 gguf-py/gguf/scripts/gguf_dump.py --no-tensors <model.gguf> | grep -i ne
 `nextn_predict_layers ≥ 1` means the head exists — drop `--no-mtp` from the
 model's `args` in env.sh (or just `./run.sh <key> --mtp 2 --save-defaults`).
 
+## run-sglang.sh (SGLang in Docker)
+
+`run.sh` serves GGUF through llama.cpp. `run-sglang.sh` is the other backend:
+the **NVFP4 W4A4** safetensors checkpoint through lmsys' prebuilt SGLang image,
+which is the only way to get the native FP4 path plus the in-checkpoint MTP
+head, the `qwen3_coder` tool-call parser and an Anthropic-compatible
+`/v1/messages` endpoint in one server.
+
+Nothing is installed on the host — the image ships its own SGLang build:
+
+```bash
+docker pull lmsysorg/sglang:qwen38-27b
+./run-sglang.sh                    # the verified defaults
+./run-sglang.sh --print            # show the docker argv, launch nothing
+./run-sglang.sh --effort low       # shallower thinking, server-wide
+./run-sglang.sh --concurrency 8    # pin --max-running-requests
+```
+
+The defaults reproduce the lmsys cookbook's **verified** RTX PRO 6000 /
+NVFP4 / EAGLE / low-latency / float32-state cell verbatim:
+
+| default | value | why |
+|---|---|---|
+| checkpoint | `RadixArk/Qwen3.8-27B-NVFP4` | W4A4 + FP8 projections, ~16.5 GB of weights |
+| KV cache | `fp8_e4m3` | the checkpoint declares `kv_cache_quant_algo: FP8` |
+| attention | `flashinfer` | `trtllm_mha` is SM100-only — it will not run on Blackwell SM120 |
+| prefill chunk | `2048` | decode stalls behind each prefill chunk on hybrid GDN; 8192 stalls it ~600 ms at a time |
+| mem fraction | `0.85` | |
+| spec decoding | `EAGLE` 3 / 1 / 4 + `--enable-linear-replayssm-spec` | the in-checkpoint MTP head; ReplaySSM moves the verify intermediates onto a fixed ring |
+| radix strategy | `extra_buffer` | 5 GDN state slots per running request |
+| GDN state dtype | `float32` | the checkpoint's declared precision, 153.9 MB per slot |
+| parsers | `qwen3` + `qwen3_coder` | without them a harness gets tool calls as raw text |
+| mm transport | `cpu` | the one deviation from the panel — see [WSL2](#wsl2-cuda-ipc) below |
+| mamba ratio | `0.29` | see below |
+
+Weights come from the HuggingFace repo id, not `$MODELS_DIR`, so the container
+pulls them into `~/.cache/huggingface` on first launch. **`./fetch-models.sh
+38-nvfp4` is not a prerequisite** — running it only puts a second copy under
+`$MODELS_DIR` that nothing reads.
+
+### WSL2: CUDA IPC
+
+**If you are on WSL2, this is the one thing you must not leave on the default.**
+`run-sglang.sh` already handles it; this is why.
+
+Left unset, `--mm-feature-transport` auto-resolves to `cuda_ipc` on any
+single-node CUDA box. Image and video features are then handed from the
+multimodal processor to the scheduler through a CUDA IPC handle — and **CUDA IPC
+does not work under WSL2's GPU paravirtualization.** Qwen3.8 is a
+vision-language model, so SGLang's own startup warmup sends an image, and the
+server dies seconds after reporting that it started:
+
+```
+[...] Failed to deserialize from cached pooled CUDA IPC handle (CUDA error: invalid resource handle
+[...] torch.AcceleratorError: CUDA error: invalid resource handle
+[...] SIGQUIT received. signum=None, frame=None. It usually means one child failed.
+```
+
+It is not an SGLang bug. A bare twenty-line PyTorch script that passes one CUDA
+tensor between two processes fails on the same host with the identical error.
+
+The fix is one flag, which the script passes by default:
+
+```
+--mm-feature-transport cpu
+```
+
+Features cross through CPU memory instead. Slightly more latency on image
+requests, no effect on text, and it frees the 1 GiB the IPC pool would have
+reserved on the GPU. On a native-Linux host you can take the faster path back
+with `./run-sglang.sh --mm-transport cuda_ipc`.
+
+`--dist-init-addr` looks like it should help — `determine_tensor_transport_mode()`
+returns CPU transport for multi-node — but that value feeds a different code
+path. `use_cuda_ipc` reads `server_args.mm_feature_transport`, so only this flag
+changes the behaviour. Tested: setting `--dist-init-addr` alone still crashes.
+
+### Thinking depth
+
+Qwen3.8 always reasons; the depth is `reasoning_effort`, one of `low`,
+`medium`, `xhigh` (the template's own default). SGLang has no dedicated flag
+for it — the server-wide default is a chat-template kwarg:
+
+```bash
+./run-sglang.sh --effort low
+#  -> --default-chat-template-kwargs '{"reasoning_effort":"low"}'
+```
+
+That applies to every request **that does not carry its own**
+`chat_template_kwargs` or `reasoning_effort`; a client that sends one still
+wins. Per request:
+
+```bash
+curl -s http://localhost:30000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"RadixArk/Qwen3.8-27B-NVFP4",
+       "reasoning_effort":"low",
+       "messages":[{"role":"user","content":"Reverse a linked list in Rust."}]}'
+```
+
+`--no-preserve-thinking` rides in the same map and drops prior-turn reasoning
+from the template. The mechanism mirrors `run.sh --effort` on the llama.cpp
+side, which passes the same key through `--chat-template-kwargs`.
+
+### --mamba-full-memory-ratio
+
+This is the one sizing flag that matters on hybrid GDN. Post-weight memory
+splits into a worst-case-reserved **GDN state pool** (which sets the
+concurrency ceiling) and a paged **attention KV pool**, divided by this ratio.
+SGLang's own default (0.9) over-provisions KV and silently clamps concurrency.
+
+```
+ratio = (S + D) × state_bytes / (L × kv_bytes_per_token)
+```
+
+- `S` — state slots per running request: `extra_buffer` 5, `extra_buffer_lazy` 4,
+  `no_buffer` 3, radix cache off 1.
+- `D` — speculative verify intermediates: **0** with spec off *and* 0 with
+  `--enable-linear-replayssm-spec`; otherwise `--speculative-num-draft-tokens`.
+- `state_bytes / kv_bytes_per_token` — the state slot priced in KV tokens:
+  **4698** at fp32 state over fp8 KV, **2394** at bf16 state.
+- `L` — average total request length in tokens, input **+** output.
+
+The built-in `0.29` is the cookbook panel's own pin, which at the defaults
+(`S=5`, `D=0`) corresponds to `L` ≈ 81k. If your workload is shorter, let the
+script recompute it for the flags actually in effect:
+
+```bash
+./run-sglang.sh --avg-len 32768                             # -> 0.72
+./run-sglang.sh --avg-len 32768 --radix extra_buffer_lazy   # S=4 -> 0.57
+./run-sglang.sh --mamba-ratio 1.5                           # or set it directly
+```
+
+Every launch prints the ratio it used and the average request length that
+implies. After boot, check the `max_running_requests` line in the server log —
+it should not be capped below your target concurrency.
+
+### Concurrency
+
+With speculative decoding on, SGLang pins `--max-running-requests` to **48**
+whenever you leave it unset. The script warns and does not guess; pass
+`--concurrency N` sized for what you actually run.
+
+### Pointing a harness at it
+
+The OpenAI endpoint is `http://localhost:30000/v1` and the `model` string must
+equal `--model-path` (`RadixArk/Qwen3.8-27B-NVFP4`) unless you shorten it with
+`--served-name`. SGLang also serves an Anthropic-compatible `/v1/messages` at
+`http://localhost:30000`, which is what Claude Code wants:
+
+```bash
+export ANTHROPIC_BASE_URL=http://localhost:30000   # no /v1 suffix
+export ANTHROPIC_AUTH_TOKEN=placeholder
+```
+
+`--api-key` is unset by default, so the server accepts unauthenticated
+requests — set one if the port is reachable beyond localhost. Full OpenCode /
+Pi / Claude Code / Hermes wiring is in the
+[lmsys cookbook page](https://lmsysorg.mintlify.app/cookbook/autoregressive/Qwen/Qwen3.8-27B#3-agent-harnesses).
+
 ## KV cache & context
 
 [How much VRAM?](#how-much-vram) covers the sizes; this is the behaviour.
@@ -358,9 +528,10 @@ cmake -B build -DGGML_CUDA=ON \
 
 - [env.sh](env.sh) — shared config + model table (override any var by exporting it)
 - [fetch-models.sh](fetch-models.sh) — HuggingFace downloader (`./fetch-models.sh` for the menu)
-- [run.sh](run.sh) — server launcher
+- [run.sh](run.sh) — server launcher (llama.cpp / GGUF)
+- [run-sglang.sh](run-sglang.sh) — SGLang launcher (Docker / NVFP4 safetensors)
 - [preflight.sh](preflight.sh) — binary/build/model/VRAM/port checks (auto-run by run.sh; `SKIP_PREFLIGHT=1` to skip)
-- `settings/` — per-model saved launch defaults (one line of run.sh flags per `<key>.conf`; written by `--save-defaults`, gitignored)
+- `settings/` — per-model saved launch defaults (one line of run.sh flags per `<key>.conf`, of run-sglang.sh flags per `<key>.sglang.conf`; written by `--save-defaults`, gitignored)
 
 ## Configuration
 
@@ -376,6 +547,12 @@ edit the default:
 | `HOST` | `0.0.0.0` | listen address; `127.0.0.1` to keep it local |
 | `EXTRA_ARGS` | — | raw flags appended to the llama-server argv |
 | `SKIP_PREFLIGHT` | `0` | `1` skips the pre-launch checks |
+| `SGLANG_IMAGE` | `lmsysorg/sglang:qwen38-27b` | image `run-sglang.sh` runs |
+| `SGLANG_PORT` | `30000` | port *inside* the container (`--port` changes the published one) |
+| `SGLANG_CONTAINER` | `qwen38-sglang` | container name `run-sglang.sh` owns and replaces |
+| `HF_CACHE` | `~/.cache/huggingface` | host cache bound into the SGLang container |
+| `HF_TOKEN` | — | passed into the container when set (gated repos) |
+| `DOCKER_ARGS` | — | raw flags appended to the `docker run` argv |
 
 `HOST` defaults to `0.0.0.0`, so the server is reachable from your network and
 llama.cpp sets permissive CORS with no API key. On an untrusted network, set
