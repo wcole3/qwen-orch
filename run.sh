@@ -16,11 +16,13 @@
 # Built-in defaults (all overridable by flag):
 #   context 262144 (native max) · f16 KV cache · MTP speculative decoding on
 #   (draft depth 2) · thinking mode on · preserve-thinking on · vision on where
-#   the model has a projector · coding sampling: top-p 0.95, top-k 20,
+#   the model has a projector, at the table's per-model image-token floor
+#   (2048 on the Qwen3.8 entries) · coding sampling: top-p 0.95, top-k 20,
 #   min-p 0.0, presence 0, repeat 1, and the table's per-model temp.
 #
 # EXTRA_ARGS="..." is appended raw to the llama-server argv (last, so it
-# overrides the composed flags) — for YaRN, --image-min-tokens, sampler tweaks.
+# overrides the composed flags) — for YaRN, --mtmd-batch-max-tokens, sampler
+# tweaks.
 # Word-split: values containing spaces are not supported.
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -56,6 +58,15 @@ flags:
   --no-preserve-thinking  drop prior-turn thinking from the template
   --no-vision             skip --mmproj for a vision model — text-only, frees
                           the projector's VRAM (no effect on text-only models)
+  --image-tokens MIN[:MAX] | auto
+                          how many tokens one image is expanded to. MIN is a
+                          floor, MAX an optional ceiling (llama-server
+                          --image-min-tokens / --image-max-tokens). Default is
+                          the table's per-model imgtok — 2048 on the Qwen3.8
+                          entries, because llama.cpp warns at load that Qwen-VL
+                          needs >= 1024 for grounding. 'auto' passes neither
+                          flag, leaving llama.cpp's model-derived sizing.
+                          Ignored by text-only models and under --no-vision
   --port P                listen port (default $PORT)
   --save-defaults         persist the effective flags of this launch to
                           settings/<model>.conf (used automatically next time)
@@ -101,6 +112,8 @@ SAVE_DEFAULTS=0
 
 MMPROJ="$(model_mmproj_path "$MODEL_KEY")"   # empty for text-only models
 TEMP_THINK="$(model_info "$MODEL_KEY" temp)" # thinking-mode default for this model
+IMGTOK_TABLE="$(model_info "$MODEL_KEY" imgtok)"  # "" = no floor for this model
+IMGTOK="$IMGTOK_TABLE"                       # --image-tokens overrides it
 
 # Per-model defaults: settings/<key>.conf beats the table's args field; CLI
 # flags are appended after them and the parser is last-one-wins, so precedence
@@ -126,6 +139,7 @@ while [[ $# -gt 0 ]]; do
     --preserve-thinking) PRESERVE=1; shift ;;
     --no-preserve-thinking) PRESERVE=0; shift ;;
     --no-vision) VISION=0; shift ;;
+    --image-tokens) IMGTOK="${2:?--image-tokens needs a value}"; shift 2 ;;
     --port) PORT="${2:?--port needs a value}"; shift 2 ;;
     --save-defaults) SAVE_DEFAULTS=1; shift ;;
     --reset-defaults)
@@ -155,6 +169,26 @@ if [[ -n "$TEMP" && ! "$TEMP" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
   echo "--temp must be a non-negative number (got: $TEMP)" >&2; exit 1
 fi
 
+# --image-tokens MIN[:MAX], or `auto` to pass neither flag. Split here so the
+# compose step below stays a straight append, and so a typo fails now rather
+# than as a llama-server usage error after the model has finished loading.
+IMG_MIN=""; IMG_MAX=""
+if [[ "$IMGTOK" == auto ]]; then
+  :                                          # llama.cpp reads both from the model
+elif [[ -n "$IMGTOK" ]]; then
+  if [[ "$IMGTOK" =~ ^([0-9]+)(:([0-9]+))?$ ]]; then
+    IMG_MIN="${BASH_REMATCH[1]}"; IMG_MAX="${BASH_REMATCH[3]}"
+    if (( IMG_MIN < 1 )); then
+      echo "--image-tokens floor must be >= 1 (got: $IMG_MIN)" >&2; exit 1
+    fi
+    if [[ -n "$IMG_MAX" ]] && (( IMG_MAX < IMG_MIN )); then
+      echo "--image-tokens ceiling $IMG_MAX is below its floor $IMG_MIN" >&2; exit 1
+    fi
+  else
+    echo "--image-tokens must be N, N:M, or auto (got: $IMGTOK)" >&2; exit 1
+  fi
+fi
+
 # The Qwen3.8 template raises on anything outside this set, and a bad value only
 # surfaces as a 500 on the first request — reject it here instead.
 if [[ -n "$EFFORT" ]]; then
@@ -180,6 +214,9 @@ if (( SAVE_DEFAULTS )); then
   if [[ -n "$EFFORT" ]];     then SAVED+=(--effort "$EFFORT"); fi
   if (( PRESERVE == 0 ));    then SAVED+=(--no-preserve-thinking); fi
   if (( VISION == 0 ));      then SAVED+=(--no-vision); fi
+  # Compared against the table, not a built-in: the floor is per-model, and the
+  # settings file replaces the table's args wholesale on the next launch.
+  if [[ "$IMGTOK" != "$IMGTOK_TABLE" ]]; then SAVED+=(--image-tokens "${IMGTOK:-auto}"); fi
   if [[ "$PORT" != "$PORT_BASE" ]]; then SAVED+=(--port "$PORT"); fi
   mkdir -p "$SETTINGS_DIR"
   printf '%s\n' "${SAVED[*]-}" > "$SETTINGS_DIR/$MODEL_KEY.conf"
@@ -204,6 +241,10 @@ ARGS=(
 if [[ -n "$MMPROJ" ]] && (( VISION )); then
   if [[ -f "$MMPROJ" ]]; then
     ARGS+=(--mmproj "$MMPROJ")
+    # Only meaningful alongside a projector — llama-server ignores them
+    # otherwise, but keeping them inside this branch keeps the argv honest.
+    [[ -n "$IMG_MIN" ]] && ARGS+=(--image-min-tokens "$IMG_MIN")
+    [[ -n "$IMG_MAX" ]] && ARGS+=(--image-max-tokens "$IMG_MAX")
   else
     echo "warning: vision projector missing ($MMPROJ) — serving text-only." >&2
     echo "         run ./fetch-models.sh $MODEL_KEY to get it." >&2
@@ -273,7 +314,13 @@ echo
 VISION_STATE=n/a
 if [[ -n "$MMPROJ" ]]; then
   if   (( ! VISION ));      then VISION_STATE=off
-  elif [[ -f "$MMPROJ" ]];  then VISION_STATE=on
+  elif [[ -f "$MMPROJ" ]];  then
+    VISION_STATE=on
+    if [[ -n "$IMG_MIN" ]]; then
+      VISION_STATE="on(img>=$IMG_MIN${IMG_MAX:+,<=$IMG_MAX})"
+    else
+      VISION_STATE="on(img=auto)"
+    fi
   else                           VISION_STATE="off(not downloaded)"; fi
 fi
 echo "Launching [$MODEL_KEY]  ctx=$CTX  kv=$KV  mtp=$([[ $MTP_ON == 1 ]] && echo "$MTP" || echo off)  thinking=$([[ $THINK == 1 ]] && echo "on(preserve=$([[ $PRESERVE == 1 ]] && echo on || echo off)${EFFORT:+,effort=$EFFORT})" || echo off)  vision=$VISION_STATE:"

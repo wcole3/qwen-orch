@@ -83,17 +83,21 @@ overhead.
 | `nvfp4-unsloth` | 23 GB | 22 GiB | — | [official unsloth NVFP4](https://huggingface.co/unsloth/Qwen3.6-27B-NVFP4), **safetensors — vLLM/SGLang only**. `run.sh` refuses it; serve with `vllm serve ~/models/Qwen3.6-27B-NVFP4`. No unsloth NVFP4 *GGUF* exists, and safetensors→GGUF NVFP4 conversion is [known-flaky](https://github.com/ggml-org/llama.cpp/discussions/23627). |
 | `38-q8` | 29 GB + 0.9 | 27 GiB + 1 | 51 GB‡ | **Qwen3.8-27B**, [unsloth GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) `Q8_0` + `mmproj-F16` — vision-language, MTP baked in. |
 | `38-bf16` | 55 GB + 0.9 | 51 GiB + 1 | 76 GB | Same repo, BF16 split GGUF + the same projector — full-precision reference. |
+| `38-huihui` | 29 GB + 0.9 | 27 GiB + 1 | 51 GB‡ | **Qwen3.8-27B abliterated**, [huihui-ai GGUF](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF) `Q8_0` + `mmproj-model-bf16` — official GGUF of [the safetensors original](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-27B-abliterated); vision and MTP untouched by the ablation. Its own repo directory, so its projector is a second 0.9 GB download. A `Q8_0_L` (38.8 GB, ablated tensors kept at BF16) sits in the same repo. |
 | `38-nvfp4` | 17 GB | —§ | — | [RadixArk NVFP4](https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4), **safetensors — SGLang only**. `run.sh` refuses it; serve with [`./run-sglang.sh`](#run-sglangsh-sglang-in-docker). W4A4 + FP8 projections, ~16.5 GB of weights, and the checkpoint declares FP8 KV. |
 
 \* at each model's *own* defaults (262k context, f16 KV unless its `args` say
 otherwise). Smaller `--ctx` or `--kv q8_0` shrinks it a lot — see
 [How much VRAM?](#how-much-vram).
 † at its default 131k context; ~69 GB at 262k (`--ctx 262144` still fits).
-‡ measured (51,230 MiB, projector loaded, 262k f16); `38-bf16` is extrapolated
-from it by the weight delta.
+‡ measured on `38-q8` (51,230 MiB, projector loaded, 262k f16). `38-huihui`
+carries the same number: identical architecture, identical 866-tensor set, and
+a byte-for-byte identical 29.047 GB file size. `38-bf16` is extrapolated from
+the measurement by the weight delta.
 
-The `+ 0.9` / `+ 1` on the Qwen3.8 rows is the shared vision projector. Both
-keys live in one directory, so it is downloaded once and counted once.
+The `+ 0.9` / `+ 1` on the Qwen3.8 rows is the vision projector. `38-q8` and
+`38-bf16` live in one directory, so theirs is downloaded once and counted once;
+`38-huihui` is a different repo and carries its own copy.
 
 § `38-nvfp4` is pulled by the SGLang container into `~/.cache/huggingface`, not
 `$MODELS_DIR`, so `./fetch-models.sh` is not part of its path.
@@ -109,15 +113,16 @@ encoder** (images and video, 27-layer ViT, patch 16). Three things follow:
   `fetch-models.sh` downloads it and `run.sh` passes `--mmproj` automatically.
   `--no-vision` serves text-only and frees the projector's memory.
 - **Different sampling.** Qwen recommends **temp 1.0** in thinking mode (3.6
-  wants 0.6), so both entries set `temp=1.0` in the table's `temp` field.
+  wants 0.6), so every Qwen3.8 entry sets `temp=1.0` in the table's `temp` field.
   Every other sampler value is unchanged.
 - **`reasoning_effort`.** Its template accepts `low`, `medium`, `xhigh`
   (default) — exposed as `--effort`. There is no `none`; use `--no-think`.
 
-Both keys share one repo directory, so the 0.9 GB projector is downloaded
-once and reused.
+`38-q8` and `38-bf16` share one repo directory, so their 0.9 GB projector is
+downloaded once and reused. `38-huihui` comes from huihui-ai's own repo, so it
+downloads a second projector of its own.
 
-The four finetune quants are provisional Q8-class picks; other sizes exist in
+The five finetune quants are provisional Q8-class picks; other sizes exist in
 the same repos — edit the `file`/`path`/`size`/`disk`/`vram` fields in
 [env.sh](env.sh) to switch.
 
@@ -211,6 +216,9 @@ downloaded.
 --temp T                temperature override  (default 0.6 thinking / 0.7 not)
 --effort L              reasoning_effort: low|medium|xhigh   (Qwen3.8 only)
 --no-vision             skip --mmproj on a vision model, serve text-only
+--image-tokens N[:M]    tokens per image: floor N, optional ceiling M
+        | auto          (default 2048 on the Qwen3.8 keys; auto = let
+                        llama.cpp size images from the model)
 --port P                listen port           (default 8081)
 --save-defaults         persist this launch's flags as the model's defaults
 --reset-defaults        delete the saved defaults and exit
@@ -276,21 +284,75 @@ never reads the key.
 
 ### Vision
 
-`38-q8` and `38-bf16` declare an `mmproj` in the table, so `run.sh` adds
-`--mmproj ~/models/Qwen3.8-27B-GGUF/mmproj-F16.gguf` and the OpenAI-compatible
-endpoint accepts `image_url` content parts. `./run.sh --list` marks the state:
+`38-q8`, `38-bf16` and `38-huihui` declare an `mmproj` in the table, so
+`run.sh` adds `--mmproj` automatically — `~/models/Qwen3.8-27B-GGUF/mmproj-F16.gguf`
+for the unsloth pair, `~/models/Huihui-Qwen3.8-27B-abliterated-GGUF/mmproj-model-bf16.gguf`
+for `38-huihui` — and the OpenAI-compatible endpoint accepts `image_url`
+content parts. `./run.sh --list` marks the state:
 `[vision]` once the projector is on disk, `[vision: not dl]` before that.
 
 A missing projector is a warning, not a failure — the server still starts,
 text-only. `--no-vision` does the same deliberately.
 
-llama.cpp warns at load that Qwen-VL models want **≥1024 image tokens** for
-grounding tasks (bounding boxes, "point at the X"). Plain description and OCR
-work fine at the default; if grounding output looks wrong, raise it:
+Images reach the server three ways, all verified against `38-q8`: a
+`data:image/png;base64,...` URI, a remote `https://` URL (llama-server
+downloads it itself), and `file://` relative to `--media-path` if you pass that
+through `EXTRA_ARGS`.
+
+#### Image tokens
+
+An image is expanded into tokens before the model sees it, and left alone
+llama.cpp sizes that from the image's own resolution — roughly
+**(width / 32) × (height / 32)**, which is patch size 16 times the projector's
+spatial merge of 2. Measured on `38-q8`:
+
+| image | native image tokens |
+|---|---|
+| 112×112 | 18 |
+| 224×224 | 51 |
+| 448×448 | 198 |
+| 896×896 | 786 |
+| 1344×756 | 1010 |
+
+That is a problem at the small end, because llama.cpp warns at load:
+
+```
+Qwen-VL models require at minimum 1024 image tokens to function correctly
+on grounding tasks
+if you encounter problems with accuracy, try adding --image-min-tokens 1024
+```
+
+A 448×448 screenshot lands at 198 — five times under the floor Qwen-VL wants
+for grounding work (bounding boxes, "point at the X"). So the Qwen3.8 entries
+carry `imgtok=2048` in the table, and `run.sh` passes `--image-min-tokens 2048`
+whenever a projector is loaded. Every image is padded up to at least 2048
+tokens; anything already larger is untouched.
+
+**It is not free.** The floor is a prefill cost — that same 448×448 image
+measures **2,118** tokens with the floor on, against 198 without it, so it costs
+about eleven times the prefill work and eleven times the context. (It overshoots
+2048 because the image is rescaled up to a whole patch grid, not to the number
+exactly.) Eight images at the floor is ~17k of your context window. Plain
+description and OCR were fine at the native sizing; the floor buys grounding
+accuracy.
+
+Override per launch, or turn it off entirely:
 
 ```bash
-EXTRA_ARGS="--image-min-tokens 1024" ./run.sh 38-q8
+./run.sh 38-q8 --image-tokens 1024        # floor only
+./run.sh 38-q8 --image-tokens 1024:4096   # floor and ceiling — caps 4K screenshots
+./run.sh 38-q8 --image-tokens auto        # neither flag; llama.cpp sizes from the model
+./run.sh 38-q8 --image-tokens 4096 --save-defaults
 ```
+
+A ceiling matters for large inputs: an unclamped 4K screenshot (3840×2160)
+costs ~8,100 tokens on its own. The floor and ceiling map to llama-server's
+`--image-min-tokens` and `--image-max-tokens`; `--mtmd-batch-max-tokens` is not
+wrapped, so reach it through `EXTRA_ARGS`.
+
+Because `imgtok` is its own table field rather than part of `args`, a
+`settings/<key>.conf` written by `--save-defaults` cannot silently drop it —
+saving an unrelated `--ctx` change leaves the model's floor intact.
 
 **MTP** uses the model's built-in draft head (`--spec-type draft-mtp`),
 giving ~1.4–2.2x generation speedup at identical output quality. The optimal

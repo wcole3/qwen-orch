@@ -63,6 +63,11 @@ export SGLANG_IMAGE SGLANG_PORT SGLANG_CONTAINER HF_CACHE
 #   file     — in-repo file (or include-glob for multi-file entries)
 #   mmproj   — in-repo multimodal projector file, or "" for text-only models.
 #              Downloaded next to the weights; run.sh passes it as --mmproj.
+#   imgtok   — minimum tokens an image is expanded to (llama-server
+#              --image-min-tokens), or "" to leave llama.cpp's model-derived
+#              value alone. Vision entries only. llama.cpp warns at load that
+#              Qwen-VL needs >= 1024 for grounding, so the Qwen3.8 entries pin
+#              2048; run.sh --image-tokens overrides per launch.
 #   temp     — thinking-mode sampling temperature (default 0.6, Unsloth's
 #              Qwen3.6 coding recommendation; Qwen3.8 wants 1.0). Belongs here
 #              rather than in args because it is mode-specific: --no-think
@@ -85,12 +90,13 @@ export SGLANG_IMAGE SGLANG_PORT SGLANG_CONTAINER HF_CACHE
 # GGUF path invariant: path == $MODELS_DIR/<repo basename>/<file> — fetch-models.sh
 # computes its download dest from repo, and its skip/verify checks from path.
 MODEL_KEYS=(nvfp4 nvfp4-attn q8 bf16 hauhau huihui aeon deckard nvfp4-unsloth
-            38-q8 38-bf16 38-nvfp4)
+            38-q8 38-bf16 38-huihui 38-nvfp4)
 
 model_info() {
   local key="$1" field="$2"
-  local repo file mmproj path fmt minbuild size disk vram temp args desc
+  local repo file mmproj path fmt minbuild size disk vram temp imgtok args desc
   mmproj=""    # text-only unless an entry sets it
+  imgtok=""    # no image-token floor unless a vision entry sets one
   temp=0.6     # Qwen3.6 thinking-mode default unless an entry overrides it
   case "$key" in
     q8)
@@ -179,7 +185,7 @@ model_info() {
       mmproj=mmproj-F16.gguf
       path="$MODELS_DIR/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q8_0.gguf"
       fmt=gguf; minbuild=0
-      size="29 GB"; disk=27; vram=51000; temp=1.0   # measured 51230 MiB at 262k/f16 + mmproj
+      size="29 GB"; disk=27; vram=51000; temp=1.0; imgtok=2048   # measured 51230 MiB at 262k/f16 + mmproj
       args=""
       desc="Qwen3.8 Q8_0 + vision, MTP baked in — near-lossless 8-bit" ;;
     38-bf16)
@@ -188,9 +194,25 @@ model_info() {
       mmproj=mmproj-F16.gguf
       path="$MODELS_DIR/Qwen3.8-27B-GGUF/BF16/Qwen3.8-27B-BF16-00001-of-00002.gguf"
       fmt=gguf; minbuild=0
-      size="55 GB"; disk=51; vram=76000; temp=1.0   # extrapolated from 38-q8 by weight delta
+      size="55 GB"; disk=51; vram=76000; temp=1.0; imgtok=2048   # extrapolated from 38-q8 by weight delta
       args=""
       desc="Qwen3.8 BF16 + vision, MTP baked in — full precision reference" ;;
+    # Same architecture and tensor set as 38-q8 (verified: arch qwen35, 866
+    # tensors, nextn_predict_layers=1, blk.64.nextn.* present), so MTP stays on
+    # and the 38-q8 VRAM measurement carries over unchanged. Unlike 38-q8 and
+    # 38-bf16 this is its own repo directory, so its projector is a separate
+    # 0.9 GB download rather than the shared one. A Q8_0_L also exists in the
+    # repo (38.8 GB — the ablated tensors kept at BF16); switch `file`/`path`
+    # and raise `size`/`disk`/`vram` to use it.
+    38-huihui)
+      repo=huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF
+      file=Huihui-Qwen3.8-27B-abliterated-Q8_0.gguf
+      mmproj=mmproj-model-bf16.gguf
+      path="$MODELS_DIR/Huihui-Qwen3.8-27B-abliterated-GGUF/Huihui-Qwen3.8-27B-abliterated-Q8_0.gguf"
+      fmt=gguf; minbuild=0
+      size="29 GB"; disk=27; vram=51000; temp=1.0; imgtok=2048
+      args=""
+      desc="Qwen3.8 Q8_0 + vision abliterated, MTP baked in" ;;
     # Served by ./run-sglang.sh, not ./run.sh: NVFP4 W4A4 is a safetensors
     # checkpoint that llama.cpp cannot load. The SGLang container pulls it into
     # $HF_CACHE from the repo id on first launch, so `./fetch-models.sh 38-nvfp4`
@@ -216,6 +238,7 @@ model_info() {
     disk)     echo "$disk" ;;
     vram)     echo "$vram" ;;
     temp)     echo "$temp" ;;
+    imgtok)   echo "$imgtok" ;;
     args)     echo "$args" ;;
     desc)     echo "$desc" ;;
     *) return 1 ;;
