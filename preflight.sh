@@ -7,9 +7,9 @@ cd "$(dirname "$0")"
 source ./env.sh
 
 MODEL_KEY="${1:?usage: ./preflight.sh <model-key>}"
-model_info "$MODEL_KEY" path >/dev/null 2>&1 \
+model_info "$MODEL_KEY" repo >/dev/null 2>&1 \
   || { echo "unknown model key: $MODEL_KEY" >&2; exit 1; }
-MODEL_PATH="$(model_info "$MODEL_KEY" path)"
+MODEL_PATH="$(model_path "$MODEL_KEY" || true)"
 NEED_VRAM="$(model_info "$MODEL_KEY" vram)"
 MIN_BUILD="$(model_info "$MODEL_KEY" minbuild)"
 
@@ -47,7 +47,7 @@ fi
 
 # 2. Model file
 if [[ -f "$MODEL_PATH" ]]; then
-  note "✓" "model: $MODEL_PATH ($(du -h "$MODEL_PATH" | cut -f1))"
+  note "✓" "model: $MODEL_PATH ($(du -hL "$MODEL_PATH" | cut -f1))"
 else
   note "✗" "model missing: $MODEL_PATH  — run ./fetch-models.sh $MODEL_KEY"
   fail=1
@@ -58,9 +58,20 @@ fi
 MMPROJ="$(model_mmproj_path "$MODEL_KEY")"
 if [[ -n "$MMPROJ" ]]; then
   if [[ -f "$MMPROJ" ]]; then
-    note "✓" "vision projector: $MMPROJ ($(du -h "$MMPROJ" | cut -f1))"
+    note "✓" "vision projector: $MMPROJ ($(du -hL "$MMPROJ" | cut -f1))"
   else
     note "⚠" "vision projector missing: $MMPROJ — text-only until you run ./fetch-models.sh $MODEL_KEY"
+  fi
+fi
+
+# 2c. Separate MTP drafter (only for models that declare one). Not a hard
+# failure either: run.sh serves without MTP and says so.
+DRAFT="$(model_draft_path "$MODEL_KEY")"
+if [[ -n "$DRAFT" ]]; then
+  if [[ -f "$DRAFT" ]]; then
+    note "✓" "MTP drafter: $DRAFT ($(du -hL "$DRAFT" | cut -f1))"
+  else
+    note "⚠" "MTP drafter missing: $DRAFT — MTP off until you run ./fetch-models.sh $MODEL_KEY"
   fi
 fi
 

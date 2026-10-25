@@ -18,7 +18,8 @@
 #   (draft depth 2) · thinking mode on · preserve-thinking on · vision on where
 #   the model has a projector, at the table's per-model image-token floor
 #   (2048 on the Qwen3.8 entries) · coding sampling: top-p 0.95, top-k 20,
-#   min-p 0.0, presence 0, repeat 1, and the table's per-model temp.
+#   min-p 0.0, presence 0, repeat 1, and the table's per-model temp (Gemma 4
+#   entries use Google's top-k 64 instead, in both thinking modes).
 #
 # EXTRA_ARGS="..." is appended raw to the llama-server argv (last, so it
 # overrides the composed flags) — for YaRN, --mtmd-batch-max-tokens, sampler
@@ -98,16 +99,16 @@ case "$1" in
 esac
 MODEL_KEY="$1"; shift
 
-model_info "$MODEL_KEY" path >/dev/null 2>&1 \
+model_info "$MODEL_KEY" repo >/dev/null 2>&1 \
   || { echo "unknown model: $MODEL_KEY" >&2; usage >&2; exit 1; }
-MODEL_PATH="$(model_info "$MODEL_KEY" path)"
+MODEL_PATH="$(model_path "$MODEL_KEY" || true)"   # preflight names it if missing
 
 if [[ "$(model_info "$MODEL_KEY" fmt)" != gguf ]]; then
   echo "$MODEL_KEY is a safetensors checkpoint — llama.cpp cannot load it." >&2
   if [[ "$MODEL_KEY" == 38-nvfp4 ]]; then
     echo "Serve it with SGLang instead:  ./run-sglang.sh" >&2
   else
-    echo "Serve it with vLLM instead:  vllm serve $MODEL_PATH" >&2
+    echo "Serve it with vLLM instead:  vllm serve $(model_info "$MODEL_KEY" repo)" >&2
   fi
   exit 1
 fi
@@ -133,7 +134,9 @@ CACHE_REUSE=""
 LORAS=()
 
 MMPROJ="$(model_mmproj_path "$MODEL_KEY")"   # empty for text-only models
+DRAFT="$(model_draft_path "$MODEL_KEY")"     # empty unless MTP is a separate model
 TEMP_THINK="$(model_info "$MODEL_KEY" temp)" # thinking-mode default for this model
+SAMPLING="$(model_info "$MODEL_KEY" sampling)" # qwen | google sampler family
 IMGTOK_TABLE="$(model_info "$MODEL_KEY" imgtok)"  # "" = no floor for this model
 IMGTOK="$IMGTOK_TABLE"                       # --image-tokens overrides it
 
@@ -304,6 +307,17 @@ fi
 
 [[ "$KV" != f16 ]] && ARGS+=(-ctk "$KV" -ctv "$KV")
 
+# A separate drafter (Gemma 4's assistant) rides in on -md; a missing one turns
+# MTP off rather than failing, since draft-mtp without a head has nothing to run.
+if (( MTP_ON )) && [[ -n "$DRAFT" ]]; then
+  if [[ -f "$DRAFT" ]]; then
+    ARGS+=(-md "$DRAFT")
+  else
+    echo "warning: MTP drafter missing ($DRAFT) — serving without MTP." >&2
+    echo "         run ./fetch-models.sh $MODEL_KEY to get it." >&2
+    MTP_ON=0
+  fi
+fi
 (( MTP_ON )) && ARGS+=(--spec-type draft-mtp --spec-draft-n-max "$MTP")
 
 # Vision projector, for models whose table entry declares one. Missing weights
@@ -329,22 +343,30 @@ fi
 # the key llama-server looks for when deciding whether to warn about preserve
 # support. reasoning_effort has no dedicated flag, so it stays a kwarg; all of
 # these land in the same map server-side, so mixing the two forms is fine.
-if (( THINK )); then
+if [[ "$SAMPLING" == google ]]; then
+  # Google's Gemma 4 recommendation, which does not change with thinking mode.
+  ARGS+=(--temp "${TEMP:-$TEMP_THINK}" --top-p 0.95 --top-k 64 --min-p 0.0
+         --presence-penalty 0.0 --repeat-penalty 1.0)
+elif (( THINK )); then
   # Unsloth-recommended sampling for coding, thinking mode. The temperature is
   # per-model (the table's temp field: 0.6 for Qwen3.6, 1.0 for Qwen3.8).
   ARGS+=(--temp "${TEMP:-$TEMP_THINK}" --top-p 0.95 --top-k 20 --min-p 0.0
-         --presence-penalty 0.0 --repeat-penalty 1.0
-         --reasoning on)
+         --presence-penalty 0.0 --repeat-penalty 1.0)
+else
+  # Unsloth-recommended sampling for non-thinking mode.
+  ARGS+=(--temp "${TEMP:-0.7}" --top-p 0.8 --top-k 20 --min-p 0.0
+         --presence-penalty 1.5 --repeat-penalty 1.0)
+fi
+
+if (( THINK )); then
+  ARGS+=(--reasoning on)
   if (( PRESERVE )); then ARGS+=(--reasoning-preserve)
   else                    ARGS+=(--no-reasoning-preserve); fi
   # Models whose template ignores reasoning_effort are unaffected by the key.
   [[ -n "$EFFORT" ]] && ARGS+=(--chat-template-kwargs "{\"reasoning_effort\":\"$EFFORT\"}")
 else
-  # Unsloth-recommended sampling for non-thinking mode. reasoning_effort is
-  # dead here — the template only reads it when thinking is on.
-  ARGS+=(--temp "${TEMP:-0.7}" --top-p 0.8 --top-k 20 --min-p 0.0
-         --presence-penalty 1.5 --repeat-penalty 1.0
-         --reasoning off)
+  # reasoning_effort is dead here — the template only reads it when thinking is on.
+  ARGS+=(--reasoning off)
 fi
 
 ARGS+=(--host "$HOST" --port "$PORT")

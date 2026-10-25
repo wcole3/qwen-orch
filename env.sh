@@ -25,10 +25,17 @@ if [[ -z "${LLAMA_SERVER:-}" ]]; then
 fi
 
 # ── Models ───────────────────────────────────────────────────────────────────
-# Weights live here. ~360 GiB to hold every entry in the table at once; each
-# entry's own requirement is its `disk` field, and ./fetch-models.sh checks the
-# free space before it downloads anything.
-MODELS_DIR="${MODELS_DIR:-$HOME/models}"
+# Weights live in the standard HuggingFace cache, the same one transformers,
+# vLLM and the SGLang container use, so a model fetched once serves them all.
+# HF_CACHE is the HF_HOME equivalent (run-sglang.sh binds it into the
+# container); HF_HUB_CACHE is its hub/ subdirectory, where the repos sit as
+# models--<org>--<name>/snapshots/<commit>/. Both follow huggingface_hub's own
+# precedence, so an HF_HOME or HF_HUB_CACHE already in your environment wins.
+# ~360 GiB to hold every entry in the table at once; each entry's own
+# requirement is its `disk` field, and ./fetch-models.sh checks the free space
+# before it downloads anything.
+HF_CACHE="${HF_CACHE:-${HF_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/huggingface}}"
+HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_CACHE/hub}"
 
 # ── Per-model saved settings (written by `run.sh <key> ... --save-defaults`) ─
 SETTINGS_DIR="${SETTINGS_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/settings}"
@@ -37,7 +44,8 @@ SETTINGS_DIR="${SETTINGS_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8081}"
 
-export LLAMA_MAINLINE LLAMA_SERVER MODELS_DIR SETTINGS_DIR HOST PORT
+# HF_HUB_CACHE is exported so `hf download` writes where model_path reads.
+export LLAMA_MAINLINE LLAMA_SERVER HF_CACHE HF_HUB_CACHE SETTINGS_DIR HOST PORT
 
 # ── SGLang (Docker) ─────────────────────────────────────────────────
 # Used by run-sglang.sh only — the llama.cpp path above is unaffected. The
@@ -48,21 +56,23 @@ SGLANG_IMAGE="${SGLANG_IMAGE:-lmsysorg/sglang:qwen38-27b}"
 SGLANG_PORT="${SGLANG_PORT:-30000}"
 SGLANG_CONTAINER="${SGLANG_CONTAINER:-qwen38-sglang}"
 
-# The SGLang container resolves its weights from a HuggingFace repo id, not from
-# $MODELS_DIR — they land in this cache on first launch. ./fetch-models.sh
-# serves the llama.cpp path and is not a prerequisite for run-sglang.sh.
-HF_CACHE="${HF_CACHE:-$HOME/.cache/huggingface}"
-
-export SGLANG_IMAGE SGLANG_PORT SGLANG_CONTAINER HF_CACHE
+# The SGLang container resolves its weights from a HuggingFace repo id through
+# $HF_CACHE (above) — the cache ./fetch-models.sh fills — so it pulls whatever is
+# missing on first launch, and ./fetch-models.sh 38-nvfp4 is an optional pre-pull.
+export SGLANG_IMAGE SGLANG_PORT SGLANG_CONTAINER
 
 # ── Model table ──────────────────────────────────────────────────────────────
 # model_info <key> <field>
 #   fields: repo | file | mmproj | path | fmt | minbuild | size | disk | vram |
-#           temp | args | desc
+#           temp | sampling | imgtok | draftrepo | draft | args | desc
 #   repo     — HuggingFace repo id
 #   file     — in-repo file (or include-glob for multi-file entries)
 #   mmproj   — in-repo multimodal projector file, or "" for text-only models.
 #              Downloaded next to the weights; run.sh passes it as --mmproj.
+#   draftrepo/draft — separate MTP drafter (repo id, in-repo GGUF) for models
+#              whose MTP head ships as its own model rather than baked into the
+#              weights, or "" for none. run.sh loads it with -md whenever MTP is
+#              on; fetch-models.sh downloads it alongside the weights.
 #   imgtok   — minimum tokens an image is expanded to (llama-server
 #              --image-min-tokens), or "" to leave llama.cpp's model-derived
 #              value alone. Vision entries only. llama.cpp warns at load that
@@ -72,7 +82,13 @@ export SGLANG_IMAGE SGLANG_PORT SGLANG_CONTAINER HF_CACHE
 #              Qwen3.6 coding recommendation; Qwen3.8 wants 1.0). Belongs here
 #              rather than in args because it is mode-specific: --no-think
 #              always uses 0.7, which every Qwen generation agrees on.
-#   path     — local path run.sh loads (-m); a directory for safetensors entries
+#   sampling — sampler family run.sh applies: qwen (default; top-k 20, and
+#              Qwen's separate non-thinking sampler) or google (Gemma 4's
+#              temp 1.0 / top-p 0.95 / top-k 64, the same in both modes).
+#   path     — in-repo path run.sh loads (-m). Defaults to `file` for GGUF
+#              entries, so only glob entries set it (the first split shard);
+#              "" for safetensors entries, meaning the snapshot directory itself.
+#              model_path resolves it to an absolute path in the HF cache.
 #   fmt      — gguf (llama.cpp-servable) | safetensors (vLLM/SGLang only)
 #   minbuild — minimum llama.cpp build number required (0 = any)
 #   size     — download size as HuggingFace reports it, in decimal GB
@@ -87,22 +103,24 @@ export SGLANG_IMAGE SGLANG_PORT SGLANG_CONTAINER HF_CACHE
 #   args     — default run.sh flags, applied before CLI flags (CLI wins).
 #              Space-separated simple flags only — values must not contain
 #              spaces (the string is word-split). settings/<key>.conf overrides.
-# GGUF path invariant: path == $MODELS_DIR/<repo basename>/<file> — fetch-models.sh
-# computes its download dest from repo, and its skip/verify checks from path.
+# Keys sharing a repo share its cache entry, so a file both use (a vision
+# projector) downloads once.
 MODEL_KEYS=(nvfp4 nvfp4-attn q8 bf16 hauhau huihui aeon deckard nvfp4-unsloth
-            38-q8 38-bf16 38-huihui 38-nvfp4)
+            38-q8 38-bf16 38-huihui 38-nvfp4 g4-heretic g4-huihui)
 
 model_info() {
   local key="$1" field="$2"
-  local repo file mmproj path fmt minbuild size disk vram temp imgtok args desc
+  local repo file mmproj path fmt minbuild size disk vram temp sampling imgtok
+  local draftrepo="" draft="" args desc
+  path=""      # GGUF entries default to `file` below
   mmproj=""    # text-only unless an entry sets it
   imgtok=""    # no image-token floor unless a vision entry sets one
   temp=0.6     # Qwen3.6 thinking-mode default unless an entry overrides it
+  sampling=qwen
   case "$key" in
     q8)
       repo=unsloth/Qwen3.6-27B-MTP-GGUF
       file=Qwen3.6-27B-Q8_0.gguf
-      path="$MODELS_DIR/Qwen3.6-27B-MTP-GGUF/Qwen3.6-27B-Q8_0.gguf"
       fmt=gguf; minbuild=0
       size="29 GB"; disk=28; vram=50000
       args=""
@@ -110,7 +128,7 @@ model_info() {
     bf16)
       repo=unsloth/Qwen3.6-27B-MTP-GGUF
       file='BF16/*'
-      path="$MODELS_DIR/Qwen3.6-27B-MTP-GGUF/BF16/Qwen3.6-27B-BF16-00001-of-00002.gguf"
+      path=BF16/Qwen3.6-27B-BF16-00001-of-00002.gguf
       fmt=gguf; minbuild=0
       size="55 GB"; disk=51; vram=76000
       args=""
@@ -118,7 +136,6 @@ model_info() {
     nvfp4)
       repo=CodeFault/Nvidia-Qwen3.6-27B-NVFP4-GGUF
       file=Nvidia-Qwen3.6-27B-NVFP4-A.gguf
-      path="$MODELS_DIR/Nvidia-Qwen3.6-27B-NVFP4-GGUF/Nvidia-Qwen3.6-27B-NVFP4-A.gguf"
       fmt=gguf; minbuild=9775
       size="18 GB"; disk=17; vram=40000
       args=""
@@ -126,7 +143,6 @@ model_info() {
     nvfp4-attn)
       repo=CodeFault/Nvidia-Qwen3.6-27B-NVFP4-GGUF
       file=Nvidia-Qwen3.6-27B-NVFP4-BF16-Attn.gguf
-      path="$MODELS_DIR/Nvidia-Qwen3.6-27B-NVFP4-GGUF/Nvidia-Qwen3.6-27B-NVFP4-BF16-Attn.gguf"
       fmt=gguf; minbuild=9775
       size="28 GB"; disk=27; vram=50000
       args=""
@@ -134,7 +150,6 @@ model_info() {
     hauhau)
       repo=HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive
       file=Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q8_K_P.gguf
-      path="$MODELS_DIR/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q8_K_P.gguf"
       fmt=gguf; minbuild=0
       size="44 GB"; disk=41; vram=51000
       args="--no-mtp"
@@ -142,7 +157,6 @@ model_info() {
     huihui)
       repo=huihui-ai/Huihui-Qwen3.6-27B-abliterated-MTP-GGUF
       file=Huihui-Qwen3.6-27B-abliterated-ggml-model-Q8_0.gguf
-      path="$MODELS_DIR/Huihui-Qwen3.6-27B-abliterated-MTP-GGUF/Huihui-Qwen3.6-27B-abliterated-ggml-model-Q8_0.gguf"
       fmt=gguf; minbuild=0
       size="29 GB"; disk=28; vram=50000
       args=""
@@ -150,7 +164,6 @@ model_info() {
     aeon)
       repo=theLittleStone/Qwen3.6-27B-AEON-Ultimate-Uncensored-MTP-i1-GGUF
       file=Qwen3.6-27B-AEON-Ultimate-Uncensored-BF16-MTP-i1.Q8_0.gguf
-      path="$MODELS_DIR/Qwen3.6-27B-AEON-Ultimate-Uncensored-MTP-i1-GGUF/Qwen3.6-27B-AEON-Ultimate-Uncensored-BF16-MTP-i1.Q8_0.gguf"
       fmt=gguf; minbuild=0
       size="29 GB"; disk=28; vram=50000
       args=""
@@ -158,7 +171,6 @@ model_info() {
     deckard)
       repo=DavidAU/Qwen3.6-40B-Claude-4.6-Opus-Deckard-Heretic-Uncensored-Thinking-NEO-CODE-Di-IMatrix-MAX-GGUF
       file=Qwen3.6-40B-Deck-Opus-NEO-CODE-HERE-2T-OT-HIGH-Q8_0.gguf
-      path="$MODELS_DIR/Qwen3.6-40B-Claude-4.6-Opus-Deckard-Heretic-Uncensored-Thinking-NEO-CODE-Di-IMatrix-MAX-GGUF/Qwen3.6-40B-Deck-Opus-NEO-CODE-HERE-2T-OT-HIGH-Q8_0.gguf"
       fmt=gguf; minbuild=0
       size="43 GB"; disk=40; vram=57000
       args="--no-mtp --ctx 131072"
@@ -166,7 +178,6 @@ model_info() {
     nvfp4-unsloth)
       repo=unsloth/Qwen3.6-27B-NVFP4
       file='*'
-      path="$MODELS_DIR/Qwen3.6-27B-NVFP4"
       fmt=safetensors; minbuild=0
       size="23 GB"; disk=22; vram=0
       args=""
@@ -183,7 +194,6 @@ model_info() {
       repo=unsloth/Qwen3.8-27B-GGUF
       file=Qwen3.8-27B-Q8_0.gguf
       mmproj=mmproj-F16.gguf
-      path="$MODELS_DIR/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q8_0.gguf"
       fmt=gguf; minbuild=0
       size="29 GB"; disk=27; vram=51000; temp=1.0; imgtok=2048   # measured 51230 MiB at 262k/f16 + mmproj
       args=""
@@ -192,7 +202,7 @@ model_info() {
       repo=unsloth/Qwen3.8-27B-GGUF
       file='BF16/*'
       mmproj=mmproj-F16.gguf
-      path="$MODELS_DIR/Qwen3.8-27B-GGUF/BF16/Qwen3.8-27B-BF16-00001-of-00002.gguf"
+      path=BF16/Qwen3.8-27B-BF16-00001-of-00002.gguf
       fmt=gguf; minbuild=0
       size="55 GB"; disk=51; vram=76000; temp=1.0; imgtok=2048   # extrapolated from 38-q8 by weight delta
       args=""
@@ -202,31 +212,64 @@ model_info() {
     # and the 38-q8 VRAM measurement carries over unchanged. Unlike 38-q8 and
     # 38-bf16 this is its own repo directory, so its projector is a separate
     # 0.9 GB download rather than the shared one. A Q8_0_L also exists in the
-    # repo (38.8 GB — the ablated tensors kept at BF16); switch `file`/`path`
-    # and raise `size`/`disk`/`vram` to use it.
+    # repo (38.8 GB — the ablated tensors kept at BF16); switch `file` and
+    # raise `size`/`disk`/`vram` to use it.
     38-huihui)
       repo=huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF
       file=Huihui-Qwen3.8-27B-abliterated-Q8_0.gguf
       mmproj=mmproj-model-bf16.gguf
-      path="$MODELS_DIR/Huihui-Qwen3.8-27B-abliterated-GGUF/Huihui-Qwen3.8-27B-abliterated-Q8_0.gguf"
       fmt=gguf; minbuild=0
       size="29 GB"; disk=27; vram=51000; temp=1.0; imgtok=2048
       args=""
       desc="Qwen3.8 Q8_0 + vision abliterated, MTP baked in" ;;
     # Served by ./run-sglang.sh, not ./run.sh: NVFP4 W4A4 is a safetensors
-    # checkpoint that llama.cpp cannot load. The SGLang container pulls it into
-    # $HF_CACHE from the repo id on first launch, so `./fetch-models.sh 38-nvfp4`
-    # is optional — it only puts a second copy under $MODELS_DIR.
+    # checkpoint that llama.cpp cannot load. The SGLang container reads it from
+    # $HF_CACHE by repo id and pulls it on first launch if missing, so
+    # `./fetch-models.sh 38-nvfp4` is optional — a pre-pull into the same cache.
     38-nvfp4)
       repo=RadixArk/Qwen3.8-27B-NVFP4
       file='*'
-      path="$MODELS_DIR/Qwen3.8-27B-NVFP4"
       fmt=safetensors; minbuild=0
       size="17 GB"; disk=16; vram=0; temp=1.0
       args=""
       desc="Qwen3.8 NVFP4 W4A4 + FP8 KV — SGLang docker, ./run-sglang.sh" ;;
+    # ── Gemma 4 26B-A4B ──────────────────────────────────────────────────────
+    # GGUF arch `gemma4`: MoE, 128 experts (8 active + 1 shared), ~4B active, so
+    # it decodes far faster than the 27B dense entries. Hybrid attention —
+    # sliding-window layers interleaved with global ones — keeps 256k KV small.
+    # Native vision, hence the mmproj; its image budgets run 70-1120 tokens, so
+    # imgtok stays empty rather than inheriting Qwen-VL's 2048 floor. No MTP
+    # head in the weights: MTP comes from Google's separate drafter,
+    # gemma-4-26B-A4B-it-assistant (arch gemma4-assistant), loaded with -md. It
+    # reads the target's hidden state and shares its KV cache, so it costs
+    # ~0.5 GiB and no extra KV.
+    # It was trained against the stock model; the heretic/abliterated weights
+    # differ slightly, so expect somewhat lower acceptance than stock.
+    # Thinking is the template's enable_thinking, which --reasoning drives.
+    # Both are Q4-class picks: other sizes sit in the same repos.
+    g4-heretic)
+      repo=llmfan46/gemma-4-26B-A4B-it-uncensored-heretic-GGUF
+      file=gemma-4-26B-A4B-it-uncensored-heretic-Q4_K_M.gguf
+      mmproj=gemma-4-26B-A4B-it-mmproj-BF16.gguf
+      fmt=gguf; minbuild=0
+      draftrepo=AtomicChat/gemma-4-26B-A4B-it-assistant-GGUF
+      draft=gemma-4-26B-A4B-it-assistant.Q8_0.gguf
+      size="17 GB"; disk=16; vram=25000; temp=1.0; sampling=google   # vram estimated, not measured
+      args=""
+      desc="Gemma 4 26B-A4B MoE Q4_K_M + vision, heretic uncensored, MTP drafter" ;;
+    g4-huihui)
+      repo=groxaxo/Huihui-gemma-4-26B-A4B-it-abliterated-GGUF
+      file=gemma-4-26B-A4B-it-UD-Q4_K_M.gguf
+      mmproj=mmproj-F16.gguf
+      fmt=gguf; minbuild=0
+      draftrepo=AtomicChat/gemma-4-26B-A4B-it-assistant-GGUF
+      draft=gemma-4-26B-A4B-it-assistant.Q8_0.gguf
+      size="17 GB"; disk=16; vram=25000; temp=1.0; sampling=google   # vram estimated, not measured
+      args=""
+      desc="Gemma 4 26B-A4B MoE UD-Q4_K_M + vision, abliterated, MTP drafter" ;;
     *) return 1 ;;
   esac
+  [[ -z "$path" && "$fmt" == gguf ]] && path="$file"
   case "$field" in
     repo)     echo "$repo" ;;
     file)     echo "$file" ;;
@@ -238,7 +281,10 @@ model_info() {
     disk)     echo "$disk" ;;
     vram)     echo "$vram" ;;
     temp)     echo "$temp" ;;
+    sampling) echo "$sampling" ;;
     imgtok)   echo "$imgtok" ;;
+    draftrepo) echo "$draftrepo" ;;
+    draft)    echo "$draft" ;;
     args)     echo "$args" ;;
     desc)     echo "$desc" ;;
     *) return 1 ;;
@@ -253,28 +299,63 @@ model_args() {
   if [[ -f "$f" ]]; then head -n1 "$f"; else model_info "$1" args; fi
 }
 
-# model_mmproj_path <key> — local path of the vision projector, empty for
-# text-only models. Mirrors the GGUF path invariant: the projector lives at the
-# repo root, so it lands beside (not inside) a split-GGUF subdirectory, and both
-# keys sharing a repo share one download.
-model_mmproj_path() {
-  local mmproj repo
-  mmproj="$(model_info "$1" mmproj)" || return 1
-  [[ -z "$mmproj" ]] && return 0
-  repo="$(model_info "$1" repo)"
-  echo "$MODELS_DIR/${repo##*/}/$mmproj"
+# hf_resolve <repo> <in-repo path> — absolute path of a file in the HF hub
+# cache; an empty in-repo path means the snapshot directory, which counts as
+# present once it holds any *.safetensors. Tries the snapshot refs/main names
+# first, then every other snapshot newest first: fetching more files after
+# upstream pushed a commit moves refs/main to a fresh snapshot that lacks the
+# files fetched earlier, and those stay valid where they are.
+# Not cached: prints where it would land and returns 1, so callers can name it.
+hf_resolve() {
+  local dir="$HF_HUB_CACHE/models--${1//\//--}" rel="$2" rev snap
+  local -a snaps=()
+  rev="$(cat "$dir/refs/main" 2>/dev/null || true)"
+  [[ -n "$rev" ]] && snaps+=("$dir/snapshots/$rev")
+  while IFS= read -r snap; do snaps+=("${snap%/}"); done \
+    < <(ls -1dt "$dir"/snapshots/*/ 2>/dev/null)
+  for snap in "${snaps[@]}"; do
+    if [[ -n "$rel" ]]; then
+      [[ -f "$snap/$rel" ]] && { echo "$snap/$rel"; return 0; }
+    elif compgen -G "$snap/*.safetensors" >/dev/null; then
+      echo "$snap"; return 0
+    fi
+  done
+  echo "$dir/snapshots/${rev:-main}${rel:+/$rel}"
+  return 1
 }
 
-# model_downloaded <key> — 0 if the model's weights are present on disk.
+# model_path <key> — absolute path run.sh loads, resolved in the HF cache.
+# Returns 1 (still printing the expected path) when it is not downloaded.
+model_path() {
+  local repo path
+  repo="$(model_info "$1" repo)" || return 1
+  path="$(model_info "$1" path)"
+  hf_resolve "$repo" "$path"
+}
+
+# model_mmproj_path <key> — absolute path of the vision projector, empty for
+# text-only models. Keys sharing a repo share one download. Prints the expected
+# path even when it is not downloaded yet; test it with -f.
+model_mmproj_path() {
+  local mmproj
+  mmproj="$(model_info "$1" mmproj)" || return 1
+  [[ -z "$mmproj" ]] && return 0
+  hf_resolve "$(model_info "$1" repo)" "$mmproj" || true
+}
+
+# model_draft_path <key> — absolute path of the separate MTP drafter, empty for
+# models without one. Like model_mmproj_path, prints the expected path even
+# when it is not downloaded yet; test it with -f.
+model_draft_path() {
+  local draft
+  draft="$(model_info "$1" draft)" || return 1
+  [[ -z "$draft" ]] && return 0
+  hf_resolve "$(model_info "$1" draftrepo)" "$draft" || true
+}
+
+# model_downloaded <key> — 0 if the model's weights are present in the cache.
 model_downloaded() {
-  local path fmt
-  path="$(model_info "$1" path)" || return 1
-  fmt="$(model_info "$1" fmt)"
-  if [[ "$fmt" == safetensors ]]; then
-    compgen -G "$path/*.safetensors" >/dev/null
-  else
-    [[ -f "$path" ]]
-  fi
+  model_path "$1" >/dev/null
 }
 
 # model_list — status table: download state, space needed, VRAM, defaults, desc.
@@ -286,7 +367,7 @@ model_list() {
   local fmt_row='%-14s %-3s %-9s %-6s %-6s %-24s %s\n'
   printf "$fmt_row" "key" "dl" "download" "disk" "~VRAM" "defaults" "description"
   printf "$fmt_row" "---" "--" "--------" "----" "-----" "--------" "-----------"
-  local key fmt mark args marker mmproj vram
+  local key fmt mark args marker mmproj draft vram
   for key in "${MODEL_KEYS[@]}"; do
     fmt="$(model_info "$key" fmt)"
     mark="-"; model_downloaded "$key" && mark="dl"
@@ -305,6 +386,8 @@ model_list() {
       if [[ -f "$mmproj" ]]; then marker="$marker [vision]"
       else                        marker="$marker [vision: not dl]"; fi
     fi
+    draft="$(model_draft_path "$key")"
+    if [[ -n "$draft" && ! -f "$draft" ]]; then marker="$marker [drafter: not dl]"; fi
     printf "$fmt_row" "$key" "$mark" \
       "$(model_info "$key" size)" "$(model_info "$key" disk)GiB" \
       "$vram" "${args:--}${marker}" "$(model_info "$key" desc)"
@@ -319,12 +402,15 @@ model_list() {
 # Already-present weights cost nothing further, so this is what fetch-models.sh
 # must actually find free, not the sum of every requested model's `disk`.
 model_disk_needed() {
-  local key total=0 mmproj
+  local key total=0 mmproj draft
   for key in "$@"; do
     model_downloaded "$key" || total=$(( total + $(model_info "$key" disk) ))
     mmproj="$(model_mmproj_path "$key")"
     # Projector is ~1 GiB and downloads separately from the weights.
     if [[ -n "$mmproj" && ! -f "$mmproj" ]]; then total=$(( total + 1 )); fi
+    # So is an MTP drafter (<1 GiB); rounded up like the projector.
+    draft="$(model_draft_path "$key")"
+    if [[ -n "$draft" && ! -f "$draft" ]]; then total=$(( total + 1 )); fi
   done
   echo "$total"
 }

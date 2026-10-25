@@ -80,11 +80,13 @@ overhead.
 | `huihui` | 29 GB | 28 GiB | 50 GB | [huihui-ai abliterated MTP-GGUF](https://huggingface.co/huihui-ai/Huihui-Qwen3.6-27B-abliterated-MTP-GGUF) `Q8_0` — 27B abliterated, official GGUF of [the safetensors original](https://huggingface.co/huihui-ai/Huihui-Qwen3.6-27B-abliterated), MTP intact. |
 | `aeon` | 29 GB | 28 GiB | 50 GB | [theLittleStone MTP-i1 GGUF](https://huggingface.co/theLittleStone/Qwen3.6-27B-AEON-Ultimate-Uncensored-MTP-i1-GGUF) `Q8_0` — imatrix conversion of [AEON Ultimate Uncensored BF16](https://huggingface.co/AEON-7/Qwen3.6-27B-AEON-Ultimate-Uncensored-BF16) with the MTP head kept. |
 | `deckard` | 43 GB | 40 GiB | 57 GB† | [DavidAU NEO-CODE IMatrix-MAX GGUF](https://huggingface.co/DavidAU/Qwen3.6-40B-Claude-4.6-Opus-Deckard-Heretic-Uncensored-Thinking-NEO-CODE-Di-IMatrix-MAX-GGUF) `Q8_0` — his own GGUF of the [40B Deckard/Heretic finetune](https://huggingface.co/DavidAU/Qwen3.6-40B-Claude-4.6-Opus-Deckard-Heretic-Uncensored-Thinking), a layer-stacked 27B (96 layers vs 65). No MTP head; KV ≈1.5× per token → defaults to 131k ctx. |
-| `nvfp4-unsloth` | 23 GB | 22 GiB | — | [official unsloth NVFP4](https://huggingface.co/unsloth/Qwen3.6-27B-NVFP4), **safetensors — vLLM/SGLang only**. `run.sh` refuses it; serve with `vllm serve ~/models/Qwen3.6-27B-NVFP4`. No unsloth NVFP4 *GGUF* exists, and safetensors→GGUF NVFP4 conversion is [known-flaky](https://github.com/ggml-org/llama.cpp/discussions/23627). |
+| `nvfp4-unsloth` | 23 GB | 22 GiB | — | [official unsloth NVFP4](https://huggingface.co/unsloth/Qwen3.6-27B-NVFP4), **safetensors — vLLM/SGLang only**. `run.sh` refuses it; serve with `vllm serve unsloth/Qwen3.6-27B-NVFP4` (vLLM reads the same HF cache). No unsloth NVFP4 *GGUF* exists, and safetensors→GGUF NVFP4 conversion is [known-flaky](https://github.com/ggml-org/llama.cpp/discussions/23627). |
 | `38-q8` | 29 GB + 0.9 | 27 GiB + 1 | 51 GB‡ | **Qwen3.8-27B**, [unsloth GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) `Q8_0` + `mmproj-F16` — vision-language, MTP baked in. |
 | `38-bf16` | 55 GB + 0.9 | 51 GiB + 1 | 76 GB | Same repo, BF16 split GGUF + the same projector — full-precision reference. |
 | `38-huihui` | 29 GB + 0.9 | 27 GiB + 1 | 51 GB‡ | **Qwen3.8-27B abliterated**, [huihui-ai GGUF](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF) `Q8_0` + `mmproj-model-bf16` — official GGUF of [the safetensors original](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-27B-abliterated); vision and MTP untouched by the ablation. Its own repo directory, so its projector is a second 0.9 GB download. A `Q8_0_L` (38.8 GB, ablated tensors kept at BF16) sits in the same repo. |
-| `38-nvfp4` | 17 GB | —§ | — | [RadixArk NVFP4](https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4), **safetensors — SGLang only**. `run.sh` refuses it; serve with [`./run-sglang.sh`](#run-sglangsh-sglang-in-docker). W4A4 + FP8 projections, ~16.5 GB of weights, and the checkpoint declares FP8 KV. |
+| `38-nvfp4` | 17 GB | 16 GiB§ | — | [RadixArk NVFP4](https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4), **safetensors — SGLang only**. `run.sh` refuses it; serve with [`./run-sglang.sh`](#run-sglangsh-sglang-in-docker). W4A4 + FP8 projections, ~16.5 GB of weights, and the checkpoint declares FP8 KV. |
+| `g4-heretic` | 17 GB + 1.2 | 16 GiB + 1 | ~25 GB (est.) | **Gemma 4 26B-A4B** MoE, [llmfan46 heretic GGUF](https://huggingface.co/llmfan46/gemma-4-26B-A4B-it-uncensored-heretic-GGUF) `Q4_K_M` + `mmproj-BF16` — uncensored, vision. ~4B active params, so decode is fast. MTP via Google's separate drafter (see below). |
+| `g4-huihui` | 17 GB + 1.2 | 16 GiB + 1 | ~25 GB (est.) | **Gemma 4 26B-A4B** MoE, [groxaxo UD GGUF](https://huggingface.co/groxaxo/Huihui-gemma-4-26B-A4B-it-abliterated-GGUF) `UD-Q4_K_M` + `mmproj-F16` of [huihui-ai's abliteration](https://huggingface.co/huihui-ai/Huihui-gemma-4-26B-A4B-it-abliterated) — vision. MTP via Google's separate drafter (see below). |
 
 \* at each model's *own* defaults (262k context, f16 KV unless its `args` say
 otherwise). Smaller `--ctx` or `--kv q8_0` shrinks it a lot — see
@@ -99,8 +101,22 @@ The `+ 0.9` / `+ 1` on the Qwen3.8 rows is the vision projector. `38-q8` and
 `38-bf16` live in one directory, so theirs is downloaded once and counted once;
 `38-huihui` is a different repo and carries its own copy.
 
-§ `38-nvfp4` is pulled by the SGLang container into `~/.cache/huggingface`, not
-`$MODELS_DIR`, so `./fetch-models.sh` is not part of its path.
+§ `38-nvfp4` is pulled by the SGLang container into the same HF cache on first
+launch, so `./fetch-models.sh 38-nvfp4` is optional — a pre-pull, not a
+prerequisite.
+
+The Gemma 4 entries use Google's sampler (temp 1.0, top-p 0.95, top-k 64) in
+both thinking modes instead of the Qwen pair — the table's `sampling` field.
+Their image budgets run 70–1120 tokens, so they carry no `--image-min-tokens`
+floor. Gemma 4 keeps its MTP head out of the weights, as a separate drafter —
+[`google/gemma-4-26B-A4B-it-assistant`](https://huggingface.co/google/gemma-4-26B-A4B-it-assistant),
+taken here as [AtomicChat's `Q8_0` GGUF](https://huggingface.co/AtomicChat/gemma-4-26B-A4B-it-assistant-GGUF)
+(0.46 GB, shared by both keys). The table's `draftrepo`/`draft` fields name it;
+`fetch-models.sh` downloads it and `run.sh` passes it as `-md` with
+`--spec-type draft-mtp`, so `--mtp N` / `--no-mtp` work as for the Qwen
+entries. It shares the target's KV cache, so it adds no KV memory. It was
+trained against stock Gemma 4, so expect somewhat lower acceptance on the
+heretic/abliterated weights.
 
 ### Qwen3.8 vs Qwen3.6
 
@@ -128,11 +144,14 @@ the same repos — edit the `file`/`path`/`size`/`disk`/`vram` fields in
 
 ## Disk space
 
-Weights go to `$MODELS_DIR`, which defaults to `~/models`. Put them on another
-filesystem by exporting it:
+Weights go to the standard HuggingFace cache — `~/.cache/huggingface/hub`,
+laid out as `models--<org>--<name>/snapshots/<commit>/` — the same one
+transformers, vLLM and the SGLang container read, so a model fetched once
+serves them all. The scripts resolve load paths inside it themselves. Put it on
+another filesystem the usual HuggingFace way:
 
 ```bash
-export MODELS_DIR=/mnt/big/models
+export HF_HOME=/mnt/big/huggingface      # or HF_HUB_CACHE for just hub/
 ```
 
 Per-model requirements are the `disk` column above and in `./run.sh --list`.
@@ -144,10 +163,10 @@ download that would not fit, so you find out before spending an hour on it:
 
 ```
 $ ./fetch-models.sh 38-bf16
-Space: need ~52 GiB, have 31 GiB free at /mnt/small/models
+Space: need ~52 GiB, have 31 GiB free at /mnt/small/huggingface/hub
 
 Not enough free space: 52 GiB required, 31 GiB available.
-Free up space, set MODELS_DIR to a bigger filesystem, or fetch fewer
+Free up space, set HF_HOME to a bigger filesystem, or fetch fewer
 models — ./fetch-models.sh lists the per-model requirement.
 ```
 
@@ -327,10 +346,9 @@ never reads the key.
 
 ### Vision
 
-`38-q8`, `38-bf16` and `38-huihui` declare an `mmproj` in the table, so
-`run.sh` adds `--mmproj` automatically — `~/models/Qwen3.8-27B-GGUF/mmproj-F16.gguf`
-for the unsloth pair, `~/models/Huihui-Qwen3.8-27B-abliterated-GGUF/mmproj-model-bf16.gguf`
-for `38-huihui` — and the OpenAI-compatible endpoint accepts `image_url`
+The Qwen3.8 and Gemma 4 entries declare an `mmproj` in the table, so `run.sh`
+adds `--mmproj` automatically — resolved from the model's own HF cache entry,
+so keys sharing a repo share the projector — and the OpenAI-compatible endpoint accepts `image_url`
 content parts. `./run.sh --list` marks the state:
 `[vision]` once the projector is on disk, `[vision: not dl]` before that.
 
@@ -449,10 +467,10 @@ NVFP4 / EAGLE / low-latency / float32-state cell verbatim:
 | mm transport | `cpu` | the one deviation from the panel — see [WSL2](#wsl2-cuda-ipc) below |
 | mamba ratio | `0.29` | see below |
 
-Weights come from the HuggingFace repo id, not `$MODELS_DIR`, so the container
-pulls them into `~/.cache/huggingface` on first launch. **`./fetch-models.sh
-38-nvfp4` is not a prerequisite** — running it only puts a second copy under
-`$MODELS_DIR` that nothing reads.
+Weights come from the HuggingFace repo id through the bound `$HF_CACHE` — the
+same cache `./fetch-models.sh` fills — so the container pulls anything missing
+on first launch. **`./fetch-models.sh 38-nvfp4` is not a prerequisite**, only a
+way to pre-pull.
 
 ### WSL2: CUDA IPC
 
@@ -645,7 +663,8 @@ edit the default:
 
 | variable | default | what it does |
 |---|---|---|
-| `MODELS_DIR` | `~/models` | where weights are downloaded and loaded from |
+| `HF_CACHE` | `$HF_HOME`, else `~/.cache/huggingface` | HF cache root: models download and load from its `hub/`; bound into the SGLang container |
+| `HF_HUB_CACHE` | `$HF_CACHE/hub` | the hub directory itself, if you need it apart from `HF_CACHE` |
 | `LLAMA_SERVER` | probed | path to the `llama-server` binary |
 | `LLAMA_MAINLINE` | `~/devspace` | directory *containing* your `llama.cpp` checkout |
 | `PORT` | `8081` | listen port (or `--port` per launch) |
@@ -655,7 +674,6 @@ edit the default:
 | `SGLANG_IMAGE` | `lmsysorg/sglang:qwen38-27b` | image `run-sglang.sh` runs |
 | `SGLANG_PORT` | `30000` | port *inside* the container (`--port` changes the published one) |
 | `SGLANG_CONTAINER` | `qwen38-sglang` | container name `run-sglang.sh` owns and replaces |
-| `HF_CACHE` | `~/.cache/huggingface` | host cache bound into the SGLang container |
 | `HF_TOKEN` | — | passed into the container when set (gated repos) |
 | `DOCKER_ARGS` | — | raw flags appended to the `docker run` argv |
 
