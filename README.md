@@ -138,7 +138,7 @@ encoder** (images and video, 27-layer ViT, patch 16). Three things follow:
 downloaded once and reused. `38-huihui` comes from huihui-ai's own repo, so it
 downloads a second projector of its own.
 
-The five finetune quants are provisional Q8-class picks; other sizes exist in
+The four finetune quants are provisional Q8-class picks; other sizes exist in
 the same repos — edit the `file`/`path`/`size`/`disk`/`vram` fields in
 [env.sh](env.sh) to switch.
 
@@ -223,22 +223,22 @@ downloaded.
 ```
 ./run.sh <model> [flags]      # the model key must be the first argument
 
---ctx N                 context length        (default 262144 = native max)
---kv f16|bf16|q8_0      KV cache type         (default f16)
---mtp N                 MTP draft depth 1-6   (default 2); re-enables MTP
-                        after a --no-mtp default
+--ctx N                 context length        (default 262144 = native max; positive integer)
+--kv f16|bf16|q8_0      KV cache type         (default f16; refuses q4_0/q4_1/q5_0/q5_1/iq4_nl — corrupts code/structured output at long context)
+--mtp N                 MTP draft depth 1-16 (useful range 1-6; default 2);
+                        re-enables MTP after a --no-mtp default
 --no-mtp                disable speculative decoding
 --think                 enable thinking mode  (default)
 --no-think              disable thinking mode entirely
 --preserve-thinking     keep prior-turn thinking (default)
 --no-preserve-thinking  drop prior-turn thinking from the chat template
 --temp T                temperature override  (default 0.6 thinking / 0.7 not)
---effort L              reasoning_effort: low|medium|xhigh   (Qwen3.8 only)
+--effort L              reasoning_effort: low|medium|xhigh   (Qwen3.8 only; ignored with --no-think)
 --no-vision             skip --mmproj on a vision model, serve text-only
 --image-tokens N[:M]    tokens per image: floor N, optional ceiling M
         | auto          (default 2048 on the Qwen3.8 keys; auto = let
                         llama.cpp size images from the model)
---port P                listen port           (default 8081)
+--port P                listen port           (default 8081; 1-65535)
 --ngl N                 layers offloaded to GPU              (default 99 = all)
 --parallel N            server slots                    (default: llama-server)
 --slot-save-path DIR    where slot KV state is saved    (default: llama-server)
@@ -449,6 +449,13 @@ docker pull lmsysorg/sglang:qwen38-27b
 ./run-sglang.sh --effort low       # shallower thinking, server-wide
 ./run-sglang.sh --concurrency 8    # pin --max-running-requests
 ```
+
+Flags: `--quant nvfp4|fp8|bf16`, `--effort low|medium|xhigh`, `--no-preserve-thinking`,
+`--ctx N`, `--concurrency N`, `--avg-len N`, `--mamba-ratio R`, `--radix`,
+`--ssm-dtype`, `--kv-dtype`, `--mem-fraction F`, `--prefill-chunk N`,
+`--attention-backend B`, `--spec eagle|none`, `--no-replayssm`, `--mm-transport`,
+`--served-name`, `--api-key`, `--port`, `--name`, `--print`, `--save-defaults`,
+`--reset-defaults`. See `./run-sglang.sh --help`.
 
 The defaults reproduce the lmsys cookbook's **verified** RTX PRO 6000 /
 NVFP4 / EAGLE / low-latency / float32-state cell verbatim:
@@ -670,6 +677,7 @@ edit the default:
 | `PORT` | `8081` | listen port (or `--port` per launch) |
 | `HOST` | `0.0.0.0` | listen address; `127.0.0.1` to keep it local |
 | `EXTRA_ARGS` | — | raw flags appended to the llama-server argv |
+| `SETTINGS_DIR` | `<repo>/settings` | directory `run.sh` reads/writes `settings/<key>.conf` from |
 | `SKIP_PREFLIGHT` | `0` | `1` skips the pre-launch checks |
 | `SGLANG_IMAGE` | `lmsysorg/sglang:qwen38-27b` | image `run-sglang.sh` runs |
 | `SGLANG_PORT` | `30000` | port *inside* the container (`--port` changes the published one) |

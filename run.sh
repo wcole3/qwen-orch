@@ -39,7 +39,7 @@ usage: ./run.sh <model> [flags] | --list
 models: see ./run.sh --list  (the key must be the first argument)
 
 flags:
-  --ctx N                 context length (default 262144 = native max;
+  --ctx N                 context length (positive integer; default 262144 = native max;
                           ~1M possible via YaRN — see README)
   --kv f16|bf16|q8_0      KV cache type (default f16; q8_0 is near-lossless
                           and halves KV memory; q4_0 refused — corrupts
@@ -71,7 +71,7 @@ flags:
                           needs >= 1024 for grounding. 'auto' passes neither
                           flag, leaving llama.cpp's model-derived sizing.
                           Ignored by text-only models and under --no-vision
-  --port P                listen port (default $PORT)
+  --port P                listen port (positive integer 1-65535; default $PORT)
   --ngl N                 layers offloaded to GPU (default 99 = all)
 
  server-tuning passthroughs (unset = llama-server's own default):
@@ -197,6 +197,14 @@ fi
 
 if [[ -n "$TEMP" && ! "$TEMP" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
   echo "--temp must be a non-negative number (got: $TEMP)" >&2; exit 1
+fi
+if ! [[ "$CTX" =~ ^[0-9]+$ ]] || (( CTX < 1 )); then
+  echo "--ctx must be a positive integer (got: $CTX)" >&2
+  exit 1
+fi
+if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
+  echo "--port must be a TCP port between 1 and 65535 (got: $PORT)" >&2
+  exit 1
 fi
 
 # --image-tokens MIN[:MAX], or `auto` to pass neither flag. Split here so the
