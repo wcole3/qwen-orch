@@ -1,9 +1,10 @@
 # Run Qwen locally with llama.cpp or SGLang
 
 A handful of scripts to download **Qwen3.6-27B** and **Qwen3.8-27B** (plus a
-few community finetunes up to 40B) and serve them on your own GPU, behind an
-OpenAI-compatible API, tuned for **precise coding**. GGUF goes through
-llama.cpp; the NVFP4 safetensors checkpoint goes through SGLang in Docker.
+few community finetunes up to 40B, Gemma 4, and Recursive's Flint) and serve
+them on your own GPU, behind an OpenAI-compatible API, tuned for **precise
+coding**. GGUF goes through llama.cpp — a host build, or the official
+container; the NVFP4 safetensors checkpoint goes through SGLang in Docker.
 
 The point is that one command gets you a working server. Every model in the
 table launches with settings that already match its own recommendations —
@@ -18,6 +19,11 @@ to reconstruct them from a dozen model cards.
   command, and `--save-defaults` makes your own tweaks stick.
 
 Qwen3.6 keys are unprefixed (`q8`, `bf16`, …); Qwen3.8 keys are prefixed `38-`.
+
+Most of this is one person on one workstation. The exception is
+[`deploy.sh`](#deploysh-a-shared-server-in-docker): one command that puts a
+model on a box for a team — several slots, a shared context pool, an API key,
+nothing compiled on the host.
 
 ## Quick start
 
@@ -38,6 +44,12 @@ docker pull lmsysorg/sglang:qwen38-27b
 ./run-sglang.sh            # Qwen3.8-27B NVFP4 under SGLang, http://0.0.0.0:30000/v1
 ```
 
+```bash
+./deploy.sh flint-q4       # Flint for a team: pulls the llama.cpp image, fetches
+                           # 25 GB, serves 8 slots with an API key, waits for health
+./deploy.sh smoke          # 8 parallel requests + a tool call against it
+```
+
 Point any OpenAI-compatible client at `http://localhost:8081/v1`:
 
 ```bash
@@ -53,9 +65,13 @@ curl -s http://localhost:8081/v1/chat/completions \
   offload (`-ngl 99`).
 - **A CUDA build of llama.cpp** — see [Building llama.cpp](#building-llamacpp).
   Set `LLAMA_SERVER` if yours is not in a location [env.sh](env.sh) probes.
-- **Python with `huggingface_hub`** — `fetch-models.sh` installs the `hf` CLI
-  with `pip --user` if it is missing.
-- **Disk space**, from 17 GiB for one small model to ~360 GiB for all of them.
+  Or no build at all: `./run.sh <key> --docker` and `./deploy.sh` use the
+  official llama.cpp image, which needs Docker and nvidia-container-toolkit
+  instead.
+- **Python 3 with the `venv` module** — `fetch-models.sh` uses the `hf` CLI
+  from your `PATH`, and otherwise installs it into `./.venv` (not
+  `pip --user`, which current Debian and Ubuntu refuse).
+- **Disk space**, from 17 GiB for one small model to ~480 GiB for all of them.
   See [Disk space](#disk-space).
 
 Developed on Linux against an RTX PRO 6000 Blackwell (96 GB), which fits every
@@ -87,6 +103,8 @@ overhead.
 | `38-nvfp4` | 17 GB | 16 GiB§ | — | [RadixArk NVFP4](https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4), **safetensors — SGLang only**. `run.sh` refuses it; serve with [`./run-sglang.sh`](#run-sglangsh-sglang-in-docker). W4A4 + FP8 projections, ~16.5 GB of weights, and the checkpoint declares FP8 KV. |
 | `g4-heretic` | 17 GB + 1.2 | 16 GiB + 1 | ~25 GB (est.) | **Gemma 4 26B-A4B** MoE, [llmfan46 heretic GGUF](https://huggingface.co/llmfan46/gemma-4-26B-A4B-it-uncensored-heretic-GGUF) `Q4_K_M` + `mmproj-BF16` — uncensored, vision. ~4B active params, so decode is fast. MTP via Google's separate drafter (see below). |
 | `g4-huihui` | 17 GB + 1.2 | 16 GiB + 1 | ~25 GB (est.) | **Gemma 4 26B-A4B** MoE, [groxaxo UD GGUF](https://huggingface.co/groxaxo/Huihui-gemma-4-26B-A4B-it-abliterated-GGUF) `UD-Q4_K_M` + `mmproj-F16` of [huihui-ai's abliteration](https://huggingface.co/huihui-ai/Huihui-gemma-4-26B-A4B-it-abliterated) — vision. MTP via Google's separate drafter (see below). |
+| `flint-q4` | 25 GB | 24 GiB | 43 GB¶ | **Recursive Flint** (40B-A2.5B MoE), [unsloth GGUF](https://huggingface.co/unsloth/flint-GGUF) `UD-Q4_K_XL` — text only, ~2.5B active params so decode is fast. Defaults are for a team: 8 slots on a shared 655k-token KV pool. Needs llama.cpp ≥ b11803; serve with [`./deploy.sh`](#deploysh-a-shared-server-in-docker). |
+| `flint-nvfp4` | 23 GB | 22 GiB | 41 GB¶ | Same model, [Recursive's own NVFP4 GGUF](https://huggingface.co/RecursiveSI/flint-nvfp4-gguf) — quantization-aware 4-bit, within about a point of BF16 on Recursive's benchmarks. Same team defaults. Recursive tested it on Blackwell only. |
 
 \* at each model's *own* defaults (262k context, f16 KV unless its `args` say
 otherwise). Smaller `--ctx` or `--kv q8_0` shrinks it a lot — see
@@ -96,6 +114,12 @@ otherwise). Smaller `--ctx` or `--kv q8_0` shrinks it a lot — see
 carries the same number: identical architecture, identical 866-tensor set, and
 a byte-for-byte identical 29.047 GB file size. `38-bf16` is extrapolated from
 the measurement by the weight delta.
+
+¶ measured: 43,100 MiB (`flint-q4`) and 40,650 MiB (`flint-nvfp4`) with all 8
+slots and the full 655,360-token pool at f16.
+The pool is allocated up front, so use barely moves it (43,170 MiB after
+700k tokens of prompts). That leaves about 2.9 GiB on a 48 GB card (46,068 MiB
+as `nvidia-smi` counts it).
 
 The `+ 0.9` / `+ 1` on the Qwen3.8 rows is the vision projector. `38-q8` and
 `38-bf16` live in one directory, so theirs is downloaded once and counted once;
@@ -155,7 +179,7 @@ export HF_HOME=/mnt/big/huggingface      # or HF_HUB_CACHE for just hub/
 ```
 
 Per-model requirements are the `disk` column above and in `./run.sh --list`.
-**Holding every entry at once takes ~360 GiB.** Nothing forces you to: most
+**Holding every entry at once takes ~480 GiB.** Nothing forces you to: most
 people want one or two.
 
 `fetch-models.sh` adds up what is actually missing and refuses to start a
@@ -254,6 +278,17 @@ downloaded.
 concurrently. The context is **split between them** — `--ctx 262144 --parallel
 2` is 131,072 tokens per slot, not 262,144 — so raise `--ctx` if each client
 needs the full window and you have the VRAM for it.
+
+`--slot-ctx N` changes that split into a **shared pool**: `--ctx` becomes the
+total every slot draws on, and N is the most one slot may hold
+(`--kv-unified --kv-unified-per-slot N`). Eight slots on a 655k pool with a
+131k cap lets a few long conversations and several short ones coexist, where an
+even split would give each a fixed 82k. It also turns on llama-server's
+`/metrics` endpoint. This is what the team entries use — see
+[deploy.sh](#deploysh-a-shared-server-in-docker).
+
+`--api-key KEY` makes the server require that key; `--print` shows the exact
+command a launch would run, without running it.
 
 `--slot-save-path DIR` lets the server persist a slot's KV cache to disk (the
 directory is created for you), and `--cache-reuse N` sets how much of a prompt
@@ -599,6 +634,168 @@ requests — set one if the port is reachable beyond localhost. Full OpenCode /
 Pi / Claude Code / Hermes wiring is in the
 [lmsys cookbook page](https://lmsysorg.mintlify.app/cookbook/autoregressive/Qwen/Qwen3.8-27B#3-agent-harnesses).
 
+## deploy.sh (a shared server in Docker)
+
+Everything above is one person on one workstation. `deploy.sh` is for the other
+case: a box that serves a team. One command checks the machine, pulls the
+official llama.cpp image, downloads the weights, starts the server in the
+background behind an API key, and waits until it answers.
+
+```bash
+git clone <this repo> && cd <this repo>
+./deploy.sh flint-q4        # ~25 GB download the first time
+./deploy.sh smoke           # 8 parallel requests + a tool call
+```
+
+```
+Serving flint-q4 — healthy after 94s
+  endpoint:  http://localhost:8081/v1   (OpenAI-compatible)
+  model id:  flint
+  API key:   in /path/to/settings/api-key   (./deploy.sh --print-key)
+```
+
+| command | what it does |
+|---|---|
+| `./deploy.sh <key> [flags]` | deploy; any [`run.sh`](#runsh) flag passes through (`--ctx`, `--parallel`, `--port`, …) |
+| `./deploy.sh status` | container state, model, endpoint, `/health` |
+| `./deploy.sh smoke [N]` | one chat, one tool call, N parallel streams (default 8) with tokens/s each |
+| `./deploy.sh logs` | follow the server log |
+| `./deploy.sh stop` | remove the container |
+| `./deploy.sh --print-key` | print the API key — the running server's, if one is up |
+
+Flags of its own: `--update` pulls a newer image, `--no-auth` serves without a
+key, `--timeout S` changes how long it waits for the server (default 1200).
+
+It is `run.sh --docker --detach` with the steps around it, so the model flags
+are the same ones documented above; `./run.sh flint-q4 --docker --detach
+--print` shows the `docker run` it will issue (deploy adds only the API key,
+passed as an environment variable).
+
+### What the box needs
+
+Nothing is compiled or installed by the script, and it never uses `sudo`. It
+checks for each of these and stops with what to install:
+
+- an NVIDIA driver (`nvidia-smi` works). The image is the CUDA 12 build, which
+  should run on R525 and newer drivers; the script prints the driver version
+  it finds
+- Docker, usable by your user without `sudo`
+- [nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html),
+  so containers can see the GPU
+- `curl`, and Python 3 with the `venv` module (for the `hf` download CLI and
+  the smoke test)
+- disk for the weights, plus about 7 GB for the image
+
+System RAM matters less than it looks. The weights are memory-mapped and
+copied to the GPU, so a 24 GiB file loads on a machine with less RAM than that;
+what the server itself holds is small (0.3 GiB idle, about 5 GiB after several
+hundred thousand tokens of prompts, bounded by llama-server's 8 GiB prompt
+cache — lower it with `EXTRA_ARGS="--cache-ram 4096"` if you need to). Do not
+add `--no-mmap` or `--mlock` on a box with less RAM than the model file.
+
+### One model, several people
+
+A GPU holds one model at a time. The container is always named `llm-serve`
+(`DEPLOY_CONTAINER`), so deploying again — the same model or another —
+replaces whatever is running, and says what it replaced. Port and URL stay the
+same, so clients do not have to change. It restarts with the Docker daemon, so
+it comes back after a reboot.
+
+The entries meant for this start with settings a single-user entry would not
+want. For `flint-q4`:
+
+| setting | value | why |
+|---|---|---|
+| `--parallel 8` | 8 slots | eight requests decode at once |
+| `--ctx 655360` | the KV pool | one pool every slot draws on, not 655k each |
+| `--slot-ctx 131072` | per-request cap | no single conversation can take more than this |
+| `--no-mtp` | | Flint has no MTP head |
+
+The pool is the number to understand. It is shared, so the limit is on the
+total held across all eight slots, not on each: eight people at 80k tokens fit,
+and so do two at 131k with six at 60k. When the pool is full the server evicts
+the cached prompt of an idle slot to make room; that person's next request
+re-reads its prompt instead of resuming from cache, and nobody gets an error.
+A single request over the cap gets a clean `400` naming the limit.
+
+**Set each agent's context limit to 131,072 or less** (most harnesses call it
+the context window or max input tokens). An agent that believes it has 262k
+will be refused once it passes the cap.
+
+Change the shape per deploy — fewer, longer conversations, for example:
+
+```bash
+./deploy.sh flint-q4 --parallel 4 --slot-ctx 163840    # same 655k pool, 4 slots
+./deploy.sh flint-q4 --ctx 393216                      # smaller pool, ~7 GiB less VRAM
+```
+
+Flint's KV costs 28 KiB per token at f16, so the pool is 17.5 GiB of the
+43 GB total; shrink `--ctx` if the card is short.
+
+### What to expect
+
+Measured on an RTX PRO 6000 Blackwell with the container (llama.cpp b12429).
+**Not measured on an A40**, which is what these defaults are sized for: memory
+use should match closely, speed will be lower.
+
+| | `flint-q4` | `flint-nvfp4` |
+|---|---|---|
+| VRAM, 8 slots + full pool | 43,100 MiB | 40,650 MiB |
+| cold start (weights not in page cache) | 94 s | 85 s |
+| 8 streams at once | 44 tok/s each, 353 tok/s together | 43 tok/s each, 345 tok/s together |
+| 8 prompts of 88k tokens at once (706k, over the pool) | all succeeded, 216 s, ~3,300 tok/s prompt processing together | not run |
+| one 124k-token prompt | 31 s | not run |
+
+`flint-nvfp4` ran here on the card's native FP4 path. That says nothing about
+cards without one (anything before Blackwell): it may be slower there, or not
+load. `flint-q4` is the entry to start with on such a card.
+
+Flint decides for itself, turn by turn, whether to reason, so `--no-think` and
+`--effort` do not apply to it and `run.sh` says so. Reasoning comes back in
+`reasoning_content`; send it back with the conversation history, as the model
+card asks. Tool calls work through the standard OpenAI `tools` field.
+
+### The API key
+
+A shared server listens on every interface, so `deploy.sh` does not start one
+without a key unless you pass `--no-auth`. The key is, in order: `$API_KEY`;
+the contents of `settings/api-key`; or a new random key written to that file
+(mode 600, and `settings/` is gitignored). It reaches the container as an
+environment variable, not on a command line. Clients send it as the usual
+bearer token:
+
+```bash
+curl -s http://<host>:8081/v1/chat/completions \
+  -H "Authorization: Bearer $(./deploy.sh --print-key)" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"flint","messages":[{"role":"user","content":"hello"}]}'
+```
+
+It is one shared key, not one per person. `HOST=127.0.0.1 ./deploy.sh <key>`
+publishes the port on localhost only, for use behind a reverse proxy or an SSH
+tunnel.
+
+### When it does not come up
+
+`deploy.sh` stops waiting as soon as the server exits, prints the last lines of
+its log, and stops the container so it does not reload in a loop.
+
+- **Out of memory while loading** (`cudaMalloc failed: out of memory`): the pool
+  does not fit next to the weights. Deploy with a smaller `--ctx`; every 100k
+  tokens is about 2.7 GiB.
+- **`no CUDA device is visible inside a container`**: nvidia-container-toolkit
+  is missing, or the driver is too old for the image.
+- **Image too old for the model**: Flint needs llama.cpp ≥ b11803. `deploy.sh`
+  pulls once by itself; `--update` forces it.
+- **Port in use by something else**: `./deploy.sh <key> --port <other>`.
+
+### Qwen3.8 for a team
+
+Not built yet. A dense 27B model with eight people on it needs real request
+batching, which is vLLM's strength rather than llama.cpp's; the design
+(vLLM with a 4-bit W4A16 checkpoint, same `deploy.sh` command) is in
+[docs/superpowers/specs/2026-11-16-48g-multiuser-deploy-design.md](docs/superpowers/specs/2026-11-16-48g-multiuser-deploy-design.md).
+
 ## KV cache & context
 
 [How much VRAM?](#how-much-vram) covers the sizes; this is the behaviour.
@@ -658,10 +855,13 @@ cmake -B build -DGGML_CUDA=ON \
 
 - [env.sh](env.sh) — shared config + model table (override any var by exporting it)
 - [fetch-models.sh](fetch-models.sh) — HuggingFace downloader (`./fetch-models.sh` for the menu)
-- [run.sh](run.sh) — server launcher (llama.cpp / GGUF)
+- [run.sh](run.sh) — server launcher (llama.cpp / GGUF; `--docker` for the container instead of a host build)
+- [deploy.sh](deploy.sh) — fetch + serve in a container in one command, for a shared box; `stop`, `status`, `logs`, `smoke`
+- [smoke.py](smoke.py) — endpoint check: a chat, a tool call, N parallel streams with tokens/s (`./deploy.sh smoke`)
 - [run-sglang.sh](run-sglang.sh) — SGLang launcher (Docker / NVFP4 safetensors)
-- [preflight.sh](preflight.sh) — binary/build/model/VRAM/port checks (auto-run by run.sh; `SKIP_PREFLIGHT=1` to skip)
-- `settings/` — per-model saved launch defaults (one line of run.sh flags per `<key>.conf`, of run-sglang.sh flags per `<key>.sglang.conf`; written by `--save-defaults`, gitignored)
+- [preflight.sh](preflight.sh) — binary-or-image/build/model/VRAM/port checks (auto-run by run.sh; `SKIP_PREFLIGHT=1` to skip)
+- `settings/` — per-model saved launch defaults (one line of run.sh flags per `<key>.conf`, of run-sglang.sh flags per `<key>.sglang.conf`; written by `--save-defaults`), and `api-key`, the key `deploy.sh` generates. Gitignored
+- [tests/run-tests.sh](tests/run-tests.sh) — what the scripts compose, checked without a GPU, Docker or weights
 
 ## Configuration
 
@@ -682,12 +882,18 @@ edit the default:
 | `SGLANG_IMAGE` | `lmsysorg/sglang:qwen38-27b` | image `run-sglang.sh` runs |
 | `SGLANG_PORT` | `30000` | port *inside* the container (`--port` changes the published one) |
 | `SGLANG_CONTAINER` | `qwen38-sglang` | container name `run-sglang.sh` owns and replaces |
-| `HF_TOKEN` | — | passed into the container when set (gated repos) |
+| `HF_TOKEN` | — | passed into the SGLang container when set (gated repos) |
 | `DOCKER_ARGS` | — | raw flags appended to the `docker run` argv |
+| `LLAMA_IMAGE` | `ghcr.io/ggml-org/llama.cpp:server-cuda` | image `run.sh --docker` and `deploy.sh` run |
+| `DEPLOY_CONTAINER` | `llm-serve` | container name they own and replace |
+| `LLAMA_DOCKER` | `0` | `1` makes `run.sh` use the container without `--docker` |
+| `API_KEY` | — | key `deploy.sh` requires from clients, instead of `settings/api-key` |
+| `HF_VENV` | `<repo>/.venv` | where `fetch-models.sh` installs the `hf` CLI when none is on `PATH` |
 
 `HOST` defaults to `0.0.0.0`, so the server is reachable from your network and
 llama.cpp sets permissive CORS with no API key. On an untrusted network, set
-`HOST=127.0.0.1`.
+`HOST=127.0.0.1`, or pass `--api-key`. `deploy.sh` is the exception: it
+requires a key unless told `--no-auth`.
 
 ## License
 

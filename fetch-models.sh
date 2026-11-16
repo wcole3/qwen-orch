@@ -4,11 +4,12 @@
 #   ./fetch-models.sh                # show the menu (with download status)
 #   ./fetch-models.sh nvfp4          # fetch one model
 #   ./fetch-models.sh q8 bf16        # fetch several
-#   ./fetch-models.sh all            # fetch everything (~360 GiB)
+#   ./fetch-models.sh all            # fetch everything (~480 GiB)
 #
 # Files land in the standard HuggingFace cache, $HF_HUB_CACHE (see env.sh).
 # Already-present files are skipped, and the free space is checked against what
 # the requested models actually need before anything is downloaded.
+# The hf CLI is taken from PATH, else from ./.venv — created on first use.
 set -euo pipefail
 cd "$(dirname "$0")"
 source ./env.sh
@@ -28,7 +29,7 @@ menu() {
   echo
   echo "Downloads go to: $HF_HUB_CACHE"
   echo "Free disk space: $(free_gib 2>/dev/null || echo '?') GiB"
-  echo "Everything at once needs ~360 GiB; the disk column is per model."
+  echo "Everything at once needs ~480 GiB; the disk column is per model."
 }
 
 if [[ $# -eq 0 || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
@@ -63,17 +64,30 @@ else
   fi
 fi
 
-# Resolve a Hugging Face downloader, installing the CLI if necessary.
+# Resolve a Hugging Face downloader: one already on PATH, else the one in this
+# repo's virtualenv, creating that if need be. A venv rather than
+# `pip install --user`, because current Debian/Ubuntu mark the system Python as
+# externally managed and refuse the latter outright. HF_VENV moves it.
+HF_VENV="${HF_VENV:-$PWD/.venv}"
 if command -v hf >/dev/null 2>&1; then
   HF=(hf download)
 elif command -v huggingface-cli >/dev/null 2>&1; then
   HF=(huggingface-cli download)
+elif [[ -x "$HF_VENV/bin/hf" ]]; then
+  HF=("$HF_VENV/bin/hf" download)
+elif (( NEEDED == 0 )); then
+  HF=(false)   # nothing to download, so no CLI is needed either
 else
-  echo "huggingface_hub CLI not found; installing with pip --user ..."
-  python3 -m pip install --user -U huggingface_hub
-  hash -r
-  if command -v hf >/dev/null 2>&1; then HF=(hf download)
-  else HF=(huggingface-cli download); fi
+  echo "hf CLI not found; installing huggingface_hub into $HF_VENV ..."
+  if ! python3 -m venv "$HF_VENV"; then
+    echo >&2
+    echo "Could not create a Python virtualenv at $HF_VENV." >&2
+    echo "Install the venv module (Debian/Ubuntu: sudo apt install python3-venv)," >&2
+    echo "or put the hf CLI on PATH yourself (pipx install huggingface_hub)." >&2
+    exit 1
+  fi
+  "$HF_VENV/bin/python" -m pip install --quiet -U huggingface_hub
+  HF=("$HF_VENV/bin/hf" download)
 fi
 
 # No --local-dir anywhere: hf then writes the standard cache layout under

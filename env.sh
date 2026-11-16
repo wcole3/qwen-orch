@@ -31,7 +31,7 @@ fi
 # container); HF_HUB_CACHE is its hub/ subdirectory, where the repos sit as
 # models--<org>--<name>/snapshots/<commit>/. Both follow huggingface_hub's own
 # precedence, so an HF_HOME or HF_HUB_CACHE already in your environment wins.
-# ~360 GiB to hold every entry in the table at once; each entry's own
+# ~480 GiB to hold every entry in the table at once; each entry's own
 # requirement is its `disk` field, and ./fetch-models.sh checks the free space
 # before it downloads anything.
 HF_CACHE="${HF_CACHE:-${HF_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/huggingface}}"
@@ -46,6 +46,18 @@ PORT="${PORT:-8081}"
 
 # HF_HUB_CACHE is exported so `hf download` writes where model_path reads.
 export LLAMA_MAINLINE LLAMA_SERVER HF_CACHE HF_HUB_CACHE SETTINGS_DIR HOST PORT
+
+# ── llama.cpp in Docker (run.sh --docker, deploy.sh) ─────────────────────────
+# The official server image: its entrypoint is llama-server, so run.sh hands it
+# the same argument list it would give a host build. The tag floats; an entry's
+# minbuild is checked against the image before launch, and a pinned tag (e.g.
+# server-cuda-b11803) can be set here instead. server-cuda is the CUDA 12 build,
+# which runs on older datacenter drivers than server-cuda13 does.
+# DEPLOY_CONTAINER is the one container name every containerised launch uses:
+# a GPU holds one model at a time, so launching replaces whatever has the name.
+LLAMA_IMAGE="${LLAMA_IMAGE:-ghcr.io/ggml-org/llama.cpp:server-cuda}"
+DEPLOY_CONTAINER="${DEPLOY_CONTAINER:-llm-serve}"
+export LLAMA_IMAGE DEPLOY_CONTAINER
 
 # ── SGLang (Docker) ─────────────────────────────────────────────────
 # Used by run-sglang.sh only — the llama.cpp path above is unaffected. The
@@ -63,8 +75,9 @@ export SGLANG_IMAGE SGLANG_PORT SGLANG_CONTAINER
 
 # ── Model table ──────────────────────────────────────────────────────────────
 # model_info <key> <field>
-#   fields: repo | file | mmproj | path | fmt | minbuild | size | disk | vram |
-#           temp | sampling | imgtok | draftrepo | draft | args | desc
+#   fields: repo | file | mmproj | path | fmt | engine | minbuild | size | disk |
+#           vram | temp | sampling | think | alias | imgtok | draftrepo | draft |
+#           args | desc
 #   repo     — HuggingFace repo id
 #   file     — in-repo file (or include-glob for multi-file entries)
 #   mmproj   — in-repo multimodal projector file, or "" for text-only models.
@@ -85,6 +98,17 @@ export SGLANG_IMAGE SGLANG_PORT SGLANG_CONTAINER
 #   sampling — sampler family run.sh applies: qwen (default; top-k 20, and
 #              Qwen's separate non-thinking sampler) or google (Gemma 4's
 #              temp 1.0 / top-p 0.95 / top-k 64, the same in both modes).
+#   think    — how thinking is controlled: switch (default; the template has
+#              an on/off switch, driven by run.sh --think/--no-think) or auto
+#              (the model decides per turn and there is nothing to switch, so
+#              run.sh passes no --reasoning flag and refuses --no-think and
+#              --effort). Flint is auto.
+#   alias    — model id clients send (llama-server --alias), or "" to leave
+#              llama-server's default, the file path. Set on the shared,
+#              multi-user entries so a team has one stable name per model.
+#   engine   — what serves the entry: llama (run.sh; the default for GGUF),
+#              sglang (run-sglang.sh), or none (no script here — serve it
+#              yourself). deploy.sh dispatches on this.
 #   path     — in-repo path run.sh loads (-m). Defaults to `file` for GGUF
 #              entries, so only glob entries set it (the first split shard);
 #              "" for safetensors entries, meaning the snapshot directory itself.
@@ -106,12 +130,13 @@ export SGLANG_IMAGE SGLANG_PORT SGLANG_CONTAINER
 # Keys sharing a repo share its cache entry, so a file both use (a vision
 # projector) downloads once.
 MODEL_KEYS=(nvfp4 nvfp4-attn q8 bf16 hauhau huihui aeon deckard nvfp4-unsloth
-            38-q8 38-bf16 38-huihui 38-nvfp4 g4-heretic g4-huihui)
+            38-q8 38-bf16 38-huihui 38-nvfp4 g4-heretic g4-huihui
+            flint-q4 flint-nvfp4)
 
 model_info() {
   local key="$1" field="$2"
   local repo file mmproj path fmt minbuild size disk vram temp sampling imgtok
-  local draftrepo="" draft="" args desc
+  local draftrepo="" draft="" args desc engine="" think=switch alias=""
   path=""      # GGUF entries default to `file` below
   mmproj=""    # text-only unless an entry sets it
   imgtok=""    # no image-token floor unless a vision entry sets one
@@ -230,7 +255,7 @@ model_info() {
       repo=RadixArk/Qwen3.8-27B-NVFP4
       file='*'
       fmt=safetensors; minbuild=0
-      size="17 GB"; disk=16; vram=0; temp=1.0
+      size="17 GB"; disk=16; vram=0; temp=1.0; engine=sglang
       args=""
       desc="Qwen3.8 NVFP4 W4A4 + FP8 KV — SGLang docker, ./run-sglang.sh" ;;
     # ── Gemma 4 26B-A4B ──────────────────────────────────────────────────────
@@ -267,15 +292,57 @@ model_info() {
       size="17 GB"; disk=16; vram=25000; temp=1.0; sampling=google   # vram estimated, not measured
       args=""
       desc="Gemma 4 26B-A4B MoE UD-Q4_K_M + vision, abliterated, MTP drafter" ;;
+    # ── Recursive Flint (40B-A2.5B) ──────────────────────────────────────────
+    # GGUF arch `flint`: 39.8B-parameter MoE, 256 experts with 6 routed per
+    # token plus a shared one, ~2.5B active — so it decodes several times faster
+    # than the dense 27B entries, which is what makes it the entry to share.
+    # Text only. 35 of the 49 layers attend to a 513-token sliding window; only
+    # the 14 full-attention layers keep KV for the whole sequence, at 28 KiB per
+    # token (f16) — 262k tokens of context cost ~7 GiB.
+    # No MTP head, hence --no-mtp. No thinking switch either (think=auto): the
+    # model decides per turn whether to reason. Recursive's recommended sampling
+    # (temp 1.0, top-p 0.95, top-k 20) is exactly the qwen thinking-mode set.
+    # KV stays f16: that is what Recursive's own llama.cpp command uses, and
+    # quantized KV is unvalidated for this architecture.
+    #
+    # Defaults are for a team, not one person: 8 slots drawing on one shared
+    # 655,360-token KV pool (--ctx is the pool; 8 x 81,920), each slot capped at
+    # 131,072 (--slot-ctx). Sized to leave ~2 GiB free on a 48 GB card.
+    # Needs llama.cpp >= b11803 (ggml-org/llama.cpp#30928), newer than most host
+    # builds — ./deploy.sh serves these from the official container.
+    flint-q4)
+      repo=unsloth/flint-GGUF
+      file=flint-UD-Q4_K_XL.gguf
+      fmt=gguf; minbuild=11803
+      size="25 GB"; disk=24; vram=43200; temp=1.0; think=auto; alias=flint   # measured 43,070-43,170 MiB over baseline, b12429, RTX PRO 6000
+      args="--no-mtp --parallel 8 --ctx 655360 --slot-ctx 131072"
+      desc="Flint 40B-A2.5B MoE UD-Q4_K_XL — 8 slots, shared 655k KV pool, ./deploy.sh" ;;
+    # Recursive's own quantization-aware 4-bit build: it benchmarks within about
+    # a point of BF16, and is slightly smaller than the Q4 above. Recursive
+    # tested it on Blackwell only (B300, RTX PRO 6000, Spark); whether
+    # llama.cpp's CUDA backend runs NVFP4 tensors on older cards is unverified.
+    flint-nvfp4)
+      repo=RecursiveSI/flint-nvfp4-gguf
+      file=flint-nvfp4.gguf
+      fmt=gguf; minbuild=11803
+      size="23 GB"; disk=22; vram=40700; temp=1.0; think=auto; alias=flint   # measured ~40,650 MiB over baseline, b12429, RTX PRO 6000
+      args="--no-mtp --parallel 8 --ctx 655360 --slot-ctx 131072"
+      desc="Flint NVFP4 (Recursive QAT) — 8 slots, shared KV pool; tested on Blackwell only" ;;
     *) return 1 ;;
   esac
   [[ -z "$path" && "$fmt" == gguf ]] && path="$file"
+  if [[ -z "$engine" ]]; then
+    if [[ "$fmt" == gguf ]]; then engine=llama; else engine=none; fi
+  fi
   case "$field" in
     repo)     echo "$repo" ;;
     file)     echo "$file" ;;
     mmproj)   echo "$mmproj" ;;
     path)     echo "$path" ;;
     fmt)      echo "$fmt" ;;
+    engine)   echo "$engine" ;;
+    think)    echo "$think" ;;
+    alias)    echo "$alias" ;;
     minbuild) echo "$minbuild" ;;
     size)     echo "$size" ;;
     disk)     echo "$disk" ;;
@@ -367,9 +434,8 @@ model_list() {
   local fmt_row='%-14s %-3s %-9s %-6s %-6s %-24s %s\n'
   printf "$fmt_row" "key" "dl" "download" "disk" "~VRAM" "defaults" "description"
   printf "$fmt_row" "---" "--" "--------" "----" "-----" "--------" "-----------"
-  local key fmt mark args marker mmproj draft vram
+  local key engine mark args marker mmproj draft vram
   for key in "${MODEL_KEYS[@]}"; do
-    fmt="$(model_info "$key" fmt)"
     mark="-"; model_downloaded "$key" && mark="dl"
     # vram=0 means "not measured" — the vLLM-only entries never run here.
     vram="$(model_info "$key" vram)"
@@ -378,9 +444,12 @@ model_list() {
     if [[ -f "$SETTINGS_DIR/$key.conf" ]]; then
       args="$(head -n1 "$SETTINGS_DIR/$key.conf")"; marker=" [saved]"
     fi
-    if [[ "$fmt" != gguf ]]; then
-      marker="$marker [vLLM/SGLang]"
-    fi
+    engine="$(model_info "$key" engine)"
+    case "$engine" in
+      llama)  ;;
+      none)   marker="$marker [vLLM/SGLang]" ;;
+      *)      marker="$marker [$engine]" ;;
+    esac
     mmproj="$(model_mmproj_path "$key")"
     if [[ -n "$mmproj" ]]; then
       if [[ -f "$mmproj" ]]; then marker="$marker [vision]"

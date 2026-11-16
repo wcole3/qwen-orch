@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Test stand-in for the docker CLI, just deep enough for deploy.sh and run.sh.
+# State lives in $STUB_DIR. "Running the container" starts a throwaway HTTP
+# server on the published port whose /health answers 200, so the real health
+# poll has something real to talk to.
+#   STUB_BUILD=N        llama.cpp build the image reports (default 12429)
+#   STUB_BUILD_AFTER_PULL=N   build reported once `docker pull` has run
+#   STUB_NO_GPU=1       no CUDA device inside the container (the CUDA library
+#                       still loads and says so on stderr, as the real one does)
+#   STUB_DIES=1         the container exits instead of serving
+#   STUB_CRASHLOOP=1    it never serves and docker keeps restarting it: running,
+#                       RestartCount > 0, and no published port to report
+#   $STUB_DIR/image-absent    exists = image not pulled yet
+set -u
+D="${STUB_DIR:?}"
+echo "$*" >> "$D/docker.calls"
+build() {
+  if [[ -e "$D/pulled" && -n "${STUB_BUILD_AFTER_PULL:-}" ]]; then echo "$STUB_BUILD_AFTER_PULL"
+  else echo "${STUB_BUILD:-12429}"; fi
+}
+case "${1:-}" in
+  info) exit 0 ;;
+  image) [[ -e "$D/image-absent" ]] && exit 1; exit 0 ;;
+  pull) rm -f "$D/image-absent"; : > "$D/pulled"; echo "stub: pulled $2" ;;
+  ps) [[ -e "$D/container" ]] && echo c0ffee; exit 0 ;;
+  rm)
+    [[ -f "$D/server.pid" ]] && kill "$(cat "$D/server.pid")" 2>/dev/null
+    rm -f "$D/container" "$D/server.pid" ;;
+  port) [[ -e "$D/container" && -z "${STUB_CRASHLOOP:-}" ]] && echo "$(cat "$D/port")/tcp -> $(cat "$D/host"):$(cat "$D/port")" ;;
+  logs) echo "stub log: load failed: out of memory" ;;
+  inspect)
+    [[ -e "$D/container" ]] || exit 1
+    case "$*" in
+      *State.Running*)
+        if   [[ -n "${STUB_DIES:-}" ]];      then echo "false 0"
+        elif [[ -n "${STUB_CRASHLOOP:-}" ]]; then echo "true 3"
+        else                                      echo "true 0"; fi ;;
+      *llm.key*)   cat "$D/label.key" ;;
+      *llm.alias*) cat "$D/label.alias" ;;
+      *Config.Env*) cat "$D/env" ;;
+    esac ;;
+  run)
+    case "$*" in
+      *--list-devices*)
+        echo "load_backend: loaded CUDA backend from /app/libggml-cuda.so" >&2
+        echo "Available devices:"
+        if [[ -z "${STUB_NO_GPU:-}" ]]; then echo "  CUDA0: Stub GPU (48000 MiB, 47000 MiB free)"
+        else echo "ggml_cuda_init: failed to initialize CUDA: forward compatibility was attempted on non supported HW" >&2
+             echo "  (none)"; fi
+        exit 0 ;;
+      *--version*) echo "version: 1.0.0-dev (build $(build), commit abc)"; exit 0 ;;
+    esac
+    # The server launch. Pull the facts deploy.sh reads back out of the argv.
+    : > "$D/env"; : > "$D/label.key"; : > "$D/label.alias"
+    prev=""
+    for a in "$@"; do
+      case "$prev" in
+        -p) echo "${a%%:*}" > "$D/host"; echo "${a##*:}" > "$D/port" ;;
+        --label) case "$a" in
+                   llm.key=*)   echo "${a#llm.key=}" > "$D/label.key" ;;
+                   llm.alias=*) echo "${a#llm.alias=}" > "$D/label.alias" ;;
+                 esac ;;
+        -e) [[ "$a" == LLAMA_API_KEY ]] && echo "LLAMA_API_KEY=${LLAMA_API_KEY:-}" > "$D/env" ;;
+      esac
+      prev="$a"
+    done
+    : > "$D/container"
+    if [[ -z "${STUB_DIES:-}${STUB_CRASHLOOP:-}" ]]; then
+      mkdir -p "$D/www"; echo '{"status":"ok"}' > "$D/www/health"
+      python3 -I -m http.server "$(cat "$D/port")" --bind 127.0.0.1 --directory "$D/www" \
+        >/dev/null 2>&1 &
+      echo $! > "$D/server.pid"
+    fi
+    echo c0ffee ;;
+esac
+exit 0

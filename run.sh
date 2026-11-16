@@ -8,6 +8,8 @@
 #   ./run.sh 38-q8 --effort low        # Qwen3.8 + vision, shallower thinking
 #   ./run.sh deckard                   # per-model defaults applied (see --list)
 #   ./run.sh --list                    # models + download state + defaults
+#   ./run.sh flint-q4 --docker         # same flags, served from the llama.cpp
+#                                      # container instead of a host build
 #
 # The model key must be the first argument. Flag precedence (last one wins):
 #   CLI flags  >  settings/<key>.conf (written by --save-defaults)
@@ -20,6 +22,12 @@
 #   (2048 on the Qwen3.8 entries) · coding sampling: top-p 0.95, top-k 20,
 #   min-p 0.0, presence 0, repeat 1, and the table's per-model temp (Gemma 4
 #   entries use Google's top-k 64 instead, in both thinking modes).
+#
+# --docker (or LLAMA_DOCKER=1) swaps only the last step: the argument list is
+# composed exactly as for a host build, then handed to the official llama.cpp
+# server image ($LLAMA_IMAGE) instead of $LLAMA_SERVER. The HuggingFace cache is
+# mounted at the same path inside the container, so no path in that list needs
+# rewriting. ./deploy.sh wraps this with the fetch and a health wait.
 #
 # EXTRA_ARGS="..." is appended raw to the llama-server argv (last, so it
 # overrides the composed flags) — for YaRN, --mtmd-batch-max-tokens, sampler
@@ -73,10 +81,34 @@ flags:
                           Ignored by text-only models and under --no-vision
   --port P                listen port (positive integer 1-65535; default $PORT)
   --ngl N                 layers offloaded to GPU (default 99 = all)
+  --api-key KEY           require this key from clients (llama-server
+                          --api-key). Never written by --save-defaults
+  --print                 print the launch command and exit — no preflight,
+                          nothing stopped, nothing started
+
+ container backend (the flags above compose the same either way):
+  --docker                serve from the llama.cpp container (\$LLAMA_IMAGE)
+                          rather than a host build; LLAMA_DOCKER=1 does the
+                          same. The container is named \$DEPLOY_CONTAINER and
+                          replaces any container already holding that name
+  --detach                with --docker: run in the background and restart
+                          with the docker daemon (--restart unless-stopped).
+                          Without it the container is foreground and removed
+                          on exit
+                          DOCKER_ARGS="..." is appended raw to the docker run
+                          argv; LLAMA_API_KEY, when set, is passed into the
+                          container by name so the key stays off the argv
 
  server-tuning passthroughs (unset = llama-server's own default):
   --parallel N            server slots. Note each slot gets ctx/N tokens, so
-                          --parallel 2 halves the per-slot context
+                          --parallel 2 halves the per-slot context — unless
+                          --slot-ctx is set
+  --slot-ctx N            share one KV pool between the slots instead of
+                          splitting it: --ctx becomes the pool every slot
+                          draws on, and N caps what one slot may hold
+                          (--kv-unified --kv-unified-per-slot N). The setup
+                          for several people on one server; also turns on
+                          the /metrics endpoint
   --slot-save-path DIR    where slot KV state is saved (created if missing;
                           a relative path resolves against your cwd)
   --cache-reuse N         min chunk size reused from the prompt-prefix cache
@@ -105,11 +137,10 @@ MODEL_PATH="$(model_path "$MODEL_KEY" || true)"   # preflight names it if missin
 
 if [[ "$(model_info "$MODEL_KEY" fmt)" != gguf ]]; then
   echo "$MODEL_KEY is a safetensors checkpoint — llama.cpp cannot load it." >&2
-  if [[ "$MODEL_KEY" == 38-nvfp4 ]]; then
-    echo "Serve it with SGLang instead:  ./run-sglang.sh" >&2
-  else
-    echo "Serve it with vLLM instead:  vllm serve $(model_info "$MODEL_KEY" repo)" >&2
-  fi
+  case "$(model_info "$MODEL_KEY" engine)" in
+    sglang) echo "Serve it with SGLang instead:  ./run-sglang.sh" >&2 ;;
+    *)      echo "Serve it with vLLM instead:  vllm serve $(model_info "$MODEL_KEY" repo)" >&2 ;;
+  esac
   exit 1
 fi
 
@@ -129,9 +160,16 @@ NGL=99
 # llama-server's own default applies and this script stays opinion-free about
 # slots, KV persistence and cache reuse.
 PARALLEL=""
+SLOT_CTX=""
 SLOT_SAVE_PATH=""
 CACHE_REUSE=""
 LORAS=()
+API_KEY_ARG=""      # never persisted — see the --save-defaults block
+PRINT_ONLY=0
+# Launch backend. Per-launch, like --print: none of these is ever written by
+# --save-defaults, so a settings file means the same thing on either backend.
+DOCKER=0; [[ "${LLAMA_DOCKER:-0}" == 1 ]] && DOCKER=1
+DETACH=0
 
 MMPROJ="$(model_mmproj_path "$MODEL_KEY")"   # empty for text-only models
 DRAFT="$(model_draft_path "$MODEL_KEY")"     # empty unless MTP is a separate model
@@ -139,6 +177,15 @@ TEMP_THINK="$(model_info "$MODEL_KEY" temp)" # thinking-mode default for this mo
 SAMPLING="$(model_info "$MODEL_KEY" sampling)" # qwen | google sampler family
 IMGTOK_TABLE="$(model_info "$MODEL_KEY" imgtok)"  # "" = no floor for this model
 IMGTOK="$IMGTOK_TABLE"                       # --image-tokens overrides it
+THINK_MODE="$(model_info "$MODEL_KEY" think)" # switch | auto (no switch to drive)
+ALIAS="$(model_info "$MODEL_KEY" alias)"     # "" = llama-server's default id
+
+# For models that decide per turn whether to reason there is nothing for these
+# flags to act on; say so rather than silently ignoring them.
+no_think_switch() {
+  echo "$1 does not apply: $MODEL_KEY decides per turn whether to reason; there is no thinking switch." >&2
+  exit 1
+}
 
 # Per-model defaults: settings/<key>.conf beats the table's args field; CLI
 # flags are appended after them and the parser is last-one-wins, so precedence
@@ -146,8 +193,16 @@ IMGTOK="$IMGTOK_TABLE"                       # --image-tokens overrides it
 DEFAULTS="$(model_args "$MODEL_KEY")"
 if [[ -n "$DEFAULTS" ]]; then
   read -r -a DEFAULT_FLAGS <<< "$DEFAULTS"   # whitespace split, no glob expansion
+  # To stderr when printing, so --print's stdout is the command and nothing
+  # else. (Looked for by hand: the flags are not parsed yet at this point.)
+  _printing=0
+  for _arg in "$@"; do
+    [[ "$_arg" == --print || "$_arg" == --dry-run ]] && _printing=1
+  done
+  if (( _printing )); then echo "defaults for $MODEL_KEY: $DEFAULTS" >&2
+  else                     echo "defaults for $MODEL_KEY: $DEFAULTS"; fi
+  unset _printing _arg
   set -- "${DEFAULT_FLAGS[@]}" "$@"
-  echo "defaults for $MODEL_KEY: $DEFAULTS"
 fi
 
 while [[ $# -gt 0 ]]; do
@@ -157,10 +212,11 @@ while [[ $# -gt 0 ]]; do
     --kv)   KV="${2:?--kv needs a value}"; shift 2 ;;
     --mtp)  MTP="${2:?--mtp needs a value}"; MTP_ON=1; shift 2 ;;
     --no-mtp) MTP_ON=0; shift ;;
-    --think) THINK=1; shift ;;
-    --no-think) THINK=0; shift ;;
+    --think)    [[ "$THINK_MODE" == auto ]] && no_think_switch "$1"; THINK=1; shift ;;
+    --no-think) [[ "$THINK_MODE" == auto ]] && no_think_switch "$1"; THINK=0; shift ;;
     --temp) TEMP="${2:?--temp needs a value}"; shift 2 ;;
-    --effort) EFFORT="${2:?--effort needs a value}"; shift 2 ;;
+    --effort)   [[ "$THINK_MODE" == auto ]] && no_think_switch "$1"
+                EFFORT="${2:?--effort needs a value}"; shift 2 ;;
     --preserve-thinking) PRESERVE=1; shift ;;
     --no-preserve-thinking) PRESERVE=0; shift ;;
     --no-vision) VISION=0; shift ;;
@@ -168,6 +224,11 @@ while [[ $# -gt 0 ]]; do
     --port) PORT="${2:?--port needs a value}"; shift 2 ;;
     --ngl) NGL="${2:?--ngl needs a value}"; shift 2 ;;
     --parallel) PARALLEL="${2:?--parallel needs a value}"; shift 2 ;;
+    --slot-ctx) SLOT_CTX="${2:?--slot-ctx needs a value}"; shift 2 ;;
+    --api-key) API_KEY_ARG="${2:?--api-key needs a value}"; shift 2 ;;
+    --print|--dry-run) PRINT_ONLY=1; shift ;;
+    --docker) DOCKER=1; shift ;;
+    --detach) DETACH=1; shift ;;
     --slot-save-path) SLOT_SAVE_PATH="${2:?--slot-save-path needs a path}"; shift 2 ;;
     --cache-reuse) CACHE_REUSE="${2:?--cache-reuse needs a value}"; shift 2 ;;
     --lora) LORAS+=("${2:?--lora needs a path}"); shift 2 ;;
@@ -207,6 +268,17 @@ if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
   exit 1
 fi
 
+if (( DETACH && ! DOCKER )); then
+  echo "--detach only applies with --docker (a host llama-server runs in the foreground)." >&2
+  exit 1
+fi
+# Docker bind mounts need absolute sources: a relative one is read as a named
+# volume, which would mount an empty volume where the weights should be.
+if (( DOCKER )) && [[ "$HF_HUB_CACHE" != /* ]]; then
+  echo "HF_HUB_CACHE must be an absolute path to mount it into the container (got: $HF_HUB_CACHE)" >&2
+  exit 1
+fi
+
 # --image-tokens MIN[:MAX], or `auto` to pass neither flag. Split here so the
 # compose step below stays a straight append, and so a typo fails now rather
 # than as a llama-server usage error after the model has finished loading.
@@ -239,13 +311,16 @@ fi
 
 # Numeric passthroughs: catch a typo here, not as a llama-server usage error
 # thirty seconds into loading the weights.
-for _pair in "ngl:$NGL" "parallel:$PARALLEL" "cache-reuse:$CACHE_REUSE"; do
+for _pair in "ngl:$NGL" "parallel:$PARALLEL" "cache-reuse:$CACHE_REUSE" "slot-ctx:$SLOT_CTX"; do
   _name="${_pair%%:*}"; _val="${_pair#*:}"
   if [[ -n "$_val" && ! "$_val" =~ ^[0-9]+$ ]]; then
     echo "--$_name must be a non-negative integer (got: $_val)" >&2; exit 1
   fi
 done
 unset _pair _name _val
+if [[ -n "$SLOT_CTX" ]] && (( SLOT_CTX < 1 )); then
+  echo "--slot-ctx must be a positive integer (got: $SLOT_CTX)" >&2; exit 1
+fi
 
 # A relative --slot-save-path is relative to the caller's cwd; this script has
 # already cd'd to its own directory, so resolve it before anything (the save
@@ -255,6 +330,19 @@ if [[ -n "$SLOT_SAVE_PATH" ]]; then
     /*) ;;
     *) SLOT_SAVE_PATH="$CALLER_PWD/$SLOT_SAVE_PATH" ;;
   esac
+fi
+
+# Same for --lora in docker mode only: the file has to be mounted, and a mount
+# needs an absolute path that means the same thing inside the container. Host
+# mode keeps passing --lora through untouched, as it always has.
+if (( DOCKER )); then
+  for _i in "${!LORAS[@]}"; do
+    case "${LORAS[$_i]}" in
+      /*) ;;
+      *) LORAS[$_i]="$CALLER_PWD/${LORAS[$_i]}" ;;
+    esac
+  done
+  unset _i
 fi
 
 # ── Save defaults ────────────────────────────────────────────────────────────
@@ -278,6 +366,7 @@ if (( SAVE_DEFAULTS )); then
   if [[ "$PORT" != "$PORT_BASE" ]]; then SAVED+=(--port "$PORT"); fi
   if (( NGL != 99 ));        then SAVED+=(--ngl "$NGL"); fi
   if [[ -n "$PARALLEL" ]];   then SAVED+=(--parallel "$PARALLEL"); fi
+  if [[ -n "$SLOT_CTX" ]];   then SAVED+=(--slot-ctx "$SLOT_CTX"); fi
   if [[ -n "$CACHE_REUSE" ]]; then SAVED+=(--cache-reuse "$CACHE_REUSE"); fi
   # Already absolute by here, so the saved line means the same thing next time
   # no matter which directory that launch is started from.
@@ -298,11 +387,17 @@ ARGS=(
 )
 
 [[ -n "$PARALLEL" ]] && ARGS+=(--parallel "$PARALLEL")
+# Shared pool: -c is then what all slots draw on together rather than a total
+# split evenly between them, and the per-slot cap keeps one long conversation
+# from running past the model's trained context. /metrics rides along because
+# this is the several-users configuration, where load is worth watching.
+[[ -n "$SLOT_CTX" ]] && ARGS+=(--kv-unified --kv-unified-per-slot "$SLOT_CTX" --metrics)
+[[ -n "$ALIAS" ]] && ARGS+=(--alias "$ALIAS")
 [[ -n "$CACHE_REUSE" ]] && ARGS+=(--cache-reuse "$CACHE_REUSE")
 # llama-server does not create the slot directory itself — it fails at startup
 # if it is missing.
 if [[ -n "$SLOT_SAVE_PATH" ]]; then
-  mkdir -p "$SLOT_SAVE_PATH"
+  (( PRINT_ONLY )) || mkdir -p "$SLOT_SAVE_PATH"   # --print changes nothing on disk
   ARGS+=(--slot-save-path "$SLOT_SAVE_PATH")
 fi
 
@@ -366,7 +461,12 @@ else
          --presence-penalty 1.5 --repeat-penalty 1.0)
 fi
 
-if (( THINK )); then
+if [[ "$THINK_MODE" == auto ]]; then
+  # Nothing to switch: the template has no enable_thinking, and forcing
+  # --reasoning on would have the parser assume every turn opens inside a
+  # reasoning block, which this kind of model does not do.
+  :
+elif (( THINK )); then
   ARGS+=(--reasoning on)
   if (( PRESERVE )); then ARGS+=(--reasoning-preserve)
   else                    ARGS+=(--no-reasoning-preserve); fi
@@ -377,7 +477,12 @@ else
   ARGS+=(--reasoning off)
 fi
 
-ARGS+=(--host "$HOST" --port "$PORT")
+[[ -n "$API_KEY_ARG" ]] && ARGS+=(--api-key "$API_KEY_ARG")
+
+# In a container the server always binds every interface; $HOST decides which
+# host address the port is published on instead (see the -p below).
+if (( DOCKER )); then ARGS+=(--host 0.0.0.0 --port "$PORT")
+else                  ARGS+=(--host "$HOST" --port "$PORT"); fi
 
 # Raw passthrough for anything run.sh doesn't wrap (--mmproj, YaRN, sampler
 # tweaks). Appended last so it overrides the composed flags. Word-split:
@@ -387,9 +492,67 @@ if [[ -n "${EXTRA_ARGS:-}" ]]; then
   ARGS+=("${EXTRA_ARGV[@]}")
 fi
 
-# Preflight (binary/model/GPU/port). Skip with SKIP_PREFLIGHT=1.
+# ── Compose the launch command ───────────────────────────────────────────────
+# Host backend: the binary and its arguments. Docker backend: the same
+# arguments after the image name — the image's entrypoint is llama-server.
+if (( DOCKER )); then
+  LAUNCH=(docker run)
+  if (( DETACH )); then
+    LAUNCH+=(-d --restart unless-stopped
+             # A server left running for months must not fill the disk with
+             # its own log; docker's default json-file driver never rotates.
+             --log-opt max-size=50m --log-opt max-file=3)
+  else
+    LAUNCH+=(--rm)
+    # A TTY lets Ctrl-C reach the server. Not when printing (keep the printed
+    # line the same wherever it is generated) or when there is no terminal.
+    if (( ! PRINT_ONLY )) && [[ -t 0 && -t 1 ]]; then LAUNCH+=(-it); fi
+  fi
+  LAUNCH+=(--name "$DEPLOY_CONTAINER" --gpus all
+           # What is being served, readable back with `docker inspect` — how a
+           # later launch (and deploy.sh status/smoke) names the model in here.
+           --label "llm.key=$MODEL_KEY" --label "llm.alias=$ALIAS"
+           -p "$HOST:$PORT:$PORT"
+           # The image's built-in healthcheck probes :8080; point it at the
+           # port actually served, or `docker ps` reports a healthy server
+           # as unhealthy.
+           --health-cmd "curl -fsS http://localhost:$PORT/health"
+           # /health answers 503 until the weights are in, which takes minutes
+           # for a large model; don't count those against the container.
+           --health-start-period 20m
+           # The whole hub directory, not one snapshot: snapshot entries are
+           # relative symlinks into blobs/, which must resolve inside too.
+           -v "$HF_HUB_CACHE:$HF_HUB_CACHE:ro")
+  [[ -n "$SLOT_SAVE_PATH" ]] && LAUNCH+=(-v "$SLOT_SAVE_PATH:$SLOT_SAVE_PATH")
+  _seen_dirs=""
+  for _lora in "${LORAS[@]-}"; do
+    [[ -n "$_lora" ]] || continue
+    _dir="$(dirname -- "$_lora")"
+    case "$_seen_dirs" in *"|$_dir|"*) continue ;; esac
+    _seen_dirs="$_seen_dirs|$_dir|"
+    LAUNCH+=(-v "$_dir:$_dir:ro")
+  done
+  unset _seen_dirs _lora _dir
+  # By name only: docker copies the value from this process's environment, so
+  # the key never appears on a command line or in what --print shows.
+  [[ -n "${LLAMA_API_KEY:-}" ]] && LAUNCH+=(-e LLAMA_API_KEY)
+  if [[ -n "${DOCKER_ARGS:-}" ]]; then
+    read -r -a DOCKER_ARGV <<< "$DOCKER_ARGS"
+    LAUNCH+=("${DOCKER_ARGV[@]}")
+  fi
+  LAUNCH+=("$LLAMA_IMAGE" "${ARGS[@]}")
+else
+  LAUNCH=("$LLAMA_SERVER" "${ARGS[@]}")
+fi
+
+if (( PRINT_ONLY )); then
+  printf '%q' "${LAUNCH[0]}"; printf ' %q' "${LAUNCH[@]:1}"; echo
+  exit 0
+fi
+
+# Preflight (binary or image / model / GPU / port). Skip with SKIP_PREFLIGHT=1.
 if [[ "${SKIP_PREFLIGHT:-0}" != "1" ]]; then
-  ./preflight.sh "$MODEL_KEY"
+  LLAMA_DOCKER="$DOCKER" ./preflight.sh "$MODEL_KEY"
 fi
 
 # port_holder — the raw `ss` LISTEN row(s) for $PORT, or empty if free. Scans
@@ -435,7 +598,26 @@ stop_running_server() {
   done
   return 0
 }
-stop_running_server
+# replace_container — the docker counterpart of stop_running_server. Matched on
+# the exact name this script owns, so an unrelated container is never touched.
+# One GPU serves one model, so whatever holds the name goes — and is named, so
+# replacing a different model is never a silent surprise.
+replace_container() {
+  local was waited_ms=0
+  [[ -n "$(docker ps -aq --filter "name=^${DEPLOY_CONTAINER}$" 2>/dev/null)" ]] || return 0
+  was="$(docker inspect -f '{{ index .Config.Labels "llm.key" }}' "$DEPLOY_CONTAINER" 2>/dev/null || true)"
+  echo "replacing container $DEPLOY_CONTAINER (was serving ${was:-an unknown model})"
+  docker rm -f "$DEPLOY_CONTAINER" >/dev/null
+  # docker-proxy can hold the published port for a moment after the container
+  # is gone; wait it out rather than report our own leftovers as a conflict.
+  while [[ -n "$(port_holder)" ]] && (( waited_ms < 30000 )); do
+    sleep 0.5; waited_ms=$(( waited_ms + 500 ))
+  done
+  return 0
+}
+
+if (( DOCKER )); then replace_container
+else                  stop_running_server; fi
 
 # Anything still LISTENing on the port belongs to someone else. Say so here,
 # instead of letting llama-server die a few lines down on a raw bind error
@@ -471,7 +653,7 @@ if [[ -n "$MMPROJ" ]]; then
     fi
   else                           VISION_STATE="off(not downloaded)"; fi
 fi
-echo "Launching [$MODEL_KEY]  ctx=$CTX  kv=$KV  mtp=$([[ $MTP_ON == 1 ]] && echo "$MTP" || echo off)  thinking=$([[ $THINK == 1 ]] && echo "on(preserve=$([[ $PRESERVE == 1 ]] && echo on || echo off)${EFFORT:+,effort=$EFFORT})" || echo off)  vision=$VISION_STATE:"
-printf '  %q' "$LLAMA_SERVER" "${ARGS[@]}"; echo
+echo "Launching [$MODEL_KEY]  ctx=$CTX  kv=$KV  mtp=$([[ $MTP_ON == 1 ]] && echo "$MTP" || echo off)  thinking=$([[ $THINK_MODE == auto ]] && echo auto || { [[ $THINK == 1 ]] && echo "on(preserve=$([[ $PRESERVE == 1 ]] && echo on || echo off)${EFFORT:+,effort=$EFFORT})" || echo off; })  vision=$VISION_STATE:"
+printf '  %q' "${LAUNCH[@]}"; echo
 echo
-exec "$LLAMA_SERVER" "${ARGS[@]}"
+exec "${LAUNCH[@]}"
