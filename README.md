@@ -1,7 +1,8 @@
 # Run Qwen locally with llama.cpp or SGLang
 
 A handful of scripts to download **Qwen3.6-27B** and **Qwen3.8-27B** (plus a
-few community finetunes up to 40B, Gemma 4, and Recursive's Flint) and serve
+few community finetunes up to 40B, Gemma 4, Recursive's Flint, and Thinking
+Machines' Inkling 2 Mini) and serve
 them on your own GPU, behind an OpenAI-compatible API, tuned for **precise
 coding**. GGUF goes through llama.cpp — a host build, or the official
 container; the NVFP4 safetensors checkpoint goes through SGLang in Docker.
@@ -48,6 +49,7 @@ docker pull lmsysorg/sglang:qwen38-27b
 ./deploy.sh flint-q4       # Flint for a team: pulls the llama.cpp image, fetches
                            # 25 GB, serves 8 slots with an API key, waits for health
 ./deploy.sh smoke          # 8 parallel requests + a tool call against it
+./deploy.sh inkling-q4     # or Inkling 2 Mini (vision) on the same box instead
 ```
 
 Point any OpenAI-compatible client at `http://localhost:8081/v1`:
@@ -71,7 +73,7 @@ curl -s http://localhost:8081/v1/chat/completions \
 - **Python 3 with the `venv` module** — `fetch-models.sh` uses the `hf` CLI
   from your `PATH`, and otherwise installs it into `./.venv` (not
   `pip --user`, which current Debian and Ubuntu refuse).
-- **Disk space**, from 17 GiB for one small model to ~480 GiB for all of them.
+- **Disk space**, from 17 GiB for one small model to ~520 GiB for all of them.
   See [Disk space](#disk-space).
 
 Developed on Linux against an RTX PRO 6000 Blackwell (96 GB), which fits every
@@ -105,6 +107,8 @@ overhead.
 | `g4-huihui` | 17 GB + 1.2 | 16 GiB + 1 | ~25 GB (est.) | **Gemma 4 26B-A4B** MoE, [groxaxo UD GGUF](https://huggingface.co/groxaxo/Huihui-gemma-4-26B-A4B-it-abliterated-GGUF) `UD-Q4_K_M` + `mmproj-F16` of [huihui-ai's abliteration](https://huggingface.co/huihui-ai/Huihui-gemma-4-26B-A4B-it-abliterated) — vision. MTP via Google's separate drafter (see below). |
 | `flint-q4` | 25 GB | 24 GiB | 43 GB¶ | **Recursive Flint** (40B-A2.5B MoE), [unsloth GGUF](https://huggingface.co/unsloth/flint-GGUF) `UD-Q4_K_XL` — text only, ~2.5B active params so decode is fast. Defaults are for a team: 8 slots on a shared 655k-token KV pool. Needs llama.cpp ≥ b11803; serve with [`./deploy.sh`](#deploysh-a-shared-server-in-docker). |
 | `flint-nvfp4` | 23 GB | 22 GiB | 41 GB¶ | Same model, [Recursive's own NVFP4 GGUF](https://huggingface.co/RecursiveSI/flint-nvfp4-gguf) — quantization-aware 4-bit, within about a point of BF16 on Recursive's benchmarks. Same team defaults. Recursive tested it on Blackwell only. |
+| `inkling-q4` | 17.6 GB + 0.6 | 17 GiB + 1 | 42 GB‖ | **Thinking Machines Inkling 2 Mini** (26B-A5.4B looped MoE), [unsloth GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) `UD-Q4_K_XL` in the mainline llama.cpp layout + `mmproj-F16` — text and image in. Defaults are for a team: 8 slots on a shared 524k KV pool. Needs llama.cpp ≥ b12611; serve with [`./deploy.sh`](#inkling-2-mini). |
+| `inkling-q8` | 22.9 GB + 0.6 | 22 GiB + 1 | 40 GB‖ | Same repo, `UD-Q8_K_XL` — the lossless reference (original NVFP4 experts, the rest BF16). 5 GiB more weights, so a smaller 393k pool. |
 
 \* at each model's *own* defaults (262k context, f16 KV unless its `args` say
 otherwise). Smaller `--ctx` or `--kv q8_0` shrinks it a lot — see
@@ -120,6 +124,11 @@ slots and the full 655,360-token pool at f16.
 The pool is allocated up front, so use barely moves it (43,170 MiB after
 700k tokens of prompts). That leaves about 2.9 GiB on a 48 GB card (46,068 MiB
 as `nvidia-smi` counts it).
+
+‖ measured: 41,811 MiB (`inkling-q4`, 524,288-token pool) and 40,257 MiB
+(`inkling-q8`, 393,216-token pool), 8 slots, projector loaded, f16 KV,
+`--ubatch 64`. Unlike the other entries, most of what the pool costs here is
+not KV — see [Inkling 2 Mini](#inkling-2-mini).
 
 The `+ 0.9` / `+ 1` on the Qwen3.8 rows is the vision projector. `38-q8` and
 `38-bf16` live in one directory, so theirs is downloaded once and counted once;
@@ -179,7 +188,7 @@ export HF_HOME=/mnt/big/huggingface      # or HF_HUB_CACHE for just hub/
 ```
 
 Per-model requirements are the `disk` column above and in `./run.sh --list`.
-**Holding every entry at once takes ~480 GiB.** Nothing forces you to: most
+**Holding every entry at once takes ~520 GiB.** Nothing forces you to: most
 people want one or two.
 
 `fetch-models.sh` adds up what is actually missing and refuses to start a
@@ -286,6 +295,11 @@ total every slot draws on, and N is the most one slot may hold
 even split would give each a fixed 82k. It also turns on llama-server's
 `/metrics` endpoint. This is what the team entries use — see
 [deploy.sh](#deploysh-a-shared-server-in-docker).
+
+`--ubatch N` sets the micro-batch (`-ub`): how many prompt tokens one forward
+pass processes. Unset leaves llama-server's 512. It only affects how fast a
+prompt is read, not decode speed. It matters for Inkling 2 Mini, whose compute
+buffer grows with `--ctx` × this value; see [Inkling 2 Mini](#inkling-2-mini).
 
 `--api-key KEY` makes the server require that key; `--print` shows the exact
 command a launch would run, without running it.
@@ -755,6 +769,94 @@ Flint decides for itself, turn by turn, whether to reason, so `--no-think` and
 `reasoning_content`; send it back with the conversation history, as the model
 card asks. Tool calls work through the standard OpenAI `tools` field.
 
+### Inkling 2 Mini
+
+```bash
+./deploy.sh inkling-q4      # ~18 GB download the first time; model id inkling-2-mini
+./deploy.sh inkling-q8      # the lossless quant instead, ~23 GB
+```
+
+Thinking Machines' 26B looped MoE: 24 layers of weights, of which the middle 12
+run three times per token, text and image in. It is served here by llama.cpp
+because that is the only engine that runs it on an A40. The
+[SGLang cookbook recipe](https://docs.sglang.io/cookbook/autoregressive/ThinkingMachines/Inkling-2-Mini)
+and vLLM's both need Hopper or Blackwell: on Ampere SGLang stops at load with
+`NVFP4 expert computation requires an SM100, SM103 or SM107 GPU`.
+
+The entries use the `Mainline_Support/` files of Unsloth's repo, the layout
+mainline llama.cpp reads. They are named `*.gguf_file` upstream; llama-server
+loads them as they are. **The image must be llama.cpp b12611 or newer.** An
+older build does not refuse the model, it answers with garbage, so `deploy.sh`
+checks the build and pulls once if the image on the box is older (one left by
+a Flint deploy may be).
+
+**Memory works differently from Flint.** Measured:
+
+```
+VRAM (MiB) ≈ 19,300 + pool × (31.7 KB + 200 B × ubatch)      inkling-q4
+             24,300 + …                                       inkling-q8
+```
+
+Only 8 of the 48 layer visits keep KV for the whole sequence, 31 KiB per token;
+the other 40 use a 1,024-token window. The larger term is llama.cpp's compute
+buffer, which grows with pool × micro-batch. At llama-server's default
+micro-batch of 512 it costs three times what the KV does, and Flint's 655k pool
+would need 100 GB. The entries therefore set `--ubatch 64`:
+
+| setting | `inkling-q4` | `inkling-q8` | why |
+|---|---|---|---|
+| `--parallel 8` | 8 slots | 8 slots | eight requests decode at once |
+| `--ctx` | 524,288 | 393,216 | the shared pool: 65k or 49k per slot if all eight are full |
+| `--slot-ctx 131072` | | | the most one conversation may hold |
+| `--ubatch 64` | | | keeps the compute buffer at 13 KB per pool token |
+
+Trading the other way is one flag: `--ubatch 128 --ctx 393216` on `inkling-q4`
+reads a long prompt about 9% faster and holds a quarter less.
+
+**What to expect.** Measured on an RTX PRO 6000 Blackwell (llama.cpp b12774),
+**not on an A40**. Memory should match closely. Speed will be lower, by about
+half going by Unsloth's own benchmark of mainline llama.cpp (a different test
+from the table below: 1,024 generated tokens, no server): 45 tokens/s on an
+A100 against 81 on this card.
+
+| | `inkling-q4` | `inkling-q8` |
+|---|---|---|
+| VRAM, 8 slots + full pool | 41,811 MiB | 40,257 MiB |
+| cold start | 31 s (weights in page cache) | 86 s (not) |
+| one stream | 57 tok/s | 61 tok/s |
+| 8 streams at once | 17 tok/s each, 135 tok/s together | 18 tok/s each, 143 tok/s together |
+| one 20k-token prompt | 31 s (644 tok/s) | not run |
+| four 20k-token prompts at once | 185 s (432 tok/s together) | not run |
+| one 125k-token prompt | 348 s (359 tok/s) | not run |
+
+Two things to plan around. Decode barely batches: eight streams together get
+2.4 times one stream's throughput (135 tok/s, where Flint's eight total 353).
+And reading a
+prompt is slow and gets slower with length, so a cold 125k-token conversation
+waits almost six minutes here before its first token. Prompt caching hides this
+for an agent that keeps appending to the same conversation; a cache eviction or
+a fresh long prompt pays it in full. Decode speed did not move with the pool
+size or the micro-batch; prompt speed moves only with the micro-batch, as
+above. Unsloth's llama.cpp fork claims about 1.5× mainline decode
+speed for this model; it is not what these entries run.
+
+`docker stats` shows the q8 container at ~21 GiB right after a cold start. That
+is the file's page cache, which the kernel reclaims; the process itself holds
+about 2 GiB.
+
+**Reasoning.** The model always reasons, at an effort level, and has no off
+switch: `--think` and `--no-think` are refused. `--effort
+none|minimal|low|medium|high|xhigh|max` sets the server-wide default (unset is
+the template's own, `high`); `none` lowers reasoning but does not remove it. A
+request that sends its own `reasoning_effort` overrides the default, and an
+unknown value there is a `500` from the template. Reasoning comes back in
+`reasoning_content`; send it back with the history. Thinking Machines'
+model card warns that the model can loop in its reasoning, especially while
+debugging: cap output tokens and agent turns in the harness.
+
+**Vision** is on by default (a 0.6 GB projector); `--no-vision` drops it.
+Sampling is the model card's: temperature 1.0 and no truncation.
+
 ### The API key
 
 A shared server listens on every interface, so `deploy.sh` does not start one
@@ -785,8 +887,8 @@ its log, and stops the container so it does not reload in a loop.
   tokens is about 2.7 GiB.
 - **`no CUDA device is visible inside a container`**: nvidia-container-toolkit
   is missing, or the driver is too old for the image.
-- **Image too old for the model**: Flint needs llama.cpp ≥ b11803. `deploy.sh`
-  pulls once by itself; `--update` forces it.
+- **Image too old for the model**: Flint needs llama.cpp ≥ b11803, Inkling 2
+  Mini ≥ b12611. `deploy.sh` pulls once by itself; `--update` forces it.
 - **Port in use by something else**: `./deploy.sh <key> --port <other>`.
 
 ### Qwen3.8 for a team

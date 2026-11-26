@@ -132,6 +132,22 @@ eq "LLAMA_IMAGE default"      "$LLAMA_IMAGE" ghcr.io/ggml-org/llama.cpp:server-c
 eq "DEPLOY_CONTAINER default" "$DEPLOY_CONTAINER" llm-serve
 contains "list marks the sglang entry"  "$(model_list | grep '^38-nvfp4 ')" "[sglang]"
 contains "list shows flint-q4"          "$(model_list)" "flint-q4"
+eq "inkling-q4 repo"     "$(model_info inkling-q4 repo)" unsloth/Inkling-2-Mini-GGUF
+eq "inkling-q4 file"     "$(model_info inkling-q4 file)" Mainline_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf_file
+eq "inkling-q4 path"     "$(model_info inkling-q4 path)" Mainline_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf_file
+eq "inkling-q4 mmproj"   "$(model_info inkling-q4 mmproj)" mmproj-F16.gguf
+eq "inkling-q4 engine"   "$(model_info inkling-q4 engine)" llama
+eq "inkling-q4 minbuild" "$(model_info inkling-q4 minbuild)" 12611
+eq "inkling-q4 think"    "$(model_info inkling-q4 think)" effort
+eq "inkling-q4 sampling" "$(model_info inkling-q4 sampling)" plain
+eq "inkling-q4 temp"     "$(model_info inkling-q4 temp)" 1.0
+eq "inkling-q4 alias"    "$(model_info inkling-q4 alias)" inkling-2-mini
+eq "inkling-q4 args"     "$(model_info inkling-q4 args)" "--no-mtp --parallel 8 --ctx 524288 --slot-ctx 131072 --ubatch 64"
+eq "inkling-q8 args"     "$(model_info inkling-q8 args)" "--no-mtp --parallel 8 --ctx 393216 --slot-ctx 131072 --ubatch 64"
+eq "inkling-q8 file"     "$(model_info inkling-q8 file)" Mainline_Support/Inkling-2-Mini-UD-Q8_K_XL.gguf_file
+eq "inkling-q8 minbuild" "$(model_info inkling-q8 minbuild)" 12611
+eq "inkling-q8 alias"    "$(model_info inkling-q8 alias)" inkling-2-mini
+contains "list shows inkling-q4"        "$(model_list)" "inkling-q4"
 
 # ── run.sh flags ─────────────────────────────────────────────────────────────
 argv_of flint-q4
@@ -169,6 +185,77 @@ has   "--metrics follows --slot-ctx" --metrics
 
 fails "--slot-ctx rejects a non-integer" ./run.sh q8 --slot-ctx lots --print
 
+# --ubatch: the micro-batch. Unset passes nothing, so llama-server's own
+# default stands and no existing entry's argv moves.
+argv_of q8
+lacks "no -ub unless asked"            -ub
+argv_of q8 --ubatch 64
+pair  "--ubatch passes -ub"            -ub 64
+fails "--ubatch rejects a non-integer" ./run.sh q8 --ubatch small --print
+fails "--ubatch rejects zero"          ./run.sh q8 --ubatch 0 --print
+./run.sh q8 --ubatch 64 --save-defaults --print >/dev/null 2>&1
+contains "save-defaults keeps --ubatch" "$(cat "$SETTINGS_DIR/q8.conf" 2>/dev/null)" "--ubatch 64"
+rm -f "$SETTINGS_DIR/q8.conf"
+
+# Inkling 2 Mini: the plain sampler, and a template that reasons at an effort
+# level with no switch (think=effort).
+argv_of inkling-q4
+eq    "inkling-q4 launches"            "$RC" 0
+pair  "inkling-q4 alias"               --alias inkling-2-mini
+pair  "inkling-q4 temp"                --temp 1.0
+pair  "inkling-q4 top-p"               --top-p 1.0
+pair  "inkling-q4 top-k"               --top-k 0
+pair  "inkling-q4 min-p"               --min-p 0.0
+pair  "inkling-q4 slots"               --parallel 8
+pair  "inkling-q4 per-slot cap"        --kv-unified-per-slot 131072
+pair  "inkling-q4 pool"                -c 524288
+pair  "inkling-q4 micro-batch"         -ub 64
+has   "inkling-q4 vision on"           --mmproj
+lacks "inkling-q4 no reasoning switch" --reasoning
+lacks "inkling-q4 no preserve flag"    --reasoning-preserve
+lacks "inkling-q4 no preserve-off flag" --no-reasoning-preserve
+lacks "inkling-q4 effort unset by default" --chat-template-kwargs
+lacks "inkling-q4 no MTP"              --spec-type
+lacks "inkling-q4 never --no-mmap"     --no-mmap
+lacks "inkling-q4 never --mlock"       --mlock
+for e in none minimal low medium high xhigh max; do
+  argv_of inkling-q4 --effort "$e"
+  pair "inkling-q4 --effort $e" --chat-template-kwargs "{\"reasoning_effort\":\"$e\"}"
+done
+argv_of inkling-q4 --temp 0.7
+pair  "plain sampler honours --temp" --temp 0.7
+# A bad effort fails at launch, not as a 500 on the first request.
+fails "effort mode rejects an unknown name" ./run.sh inkling-q4 --effort hi --print
+contains "…lists the valid names"           "$ERR" "none, minimal, low, medium, high, xhigh, max"
+fails "effort mode rejects a number"        ./run.sh inkling-q4 --effort 0.5 --print
+# --no-think out of habit must not start a server that reasons anyway.
+fails "effort mode rejects --no-think"      ./run.sh inkling-q4 --no-think --print
+contains "…names the alternative"           "$ERR" "--effort none"
+fails "effort mode rejects --think"         ./run.sh inkling-q4 --think --print
+argv_of inkling-q4 --no-vision
+lacks "inkling-q4 --no-vision drops the projector" --mmproj
+mkdir -p "$TMP/noproj"; fake_hub "$TMP/noproj"
+rm -f "$TMP/noproj/models--unsloth--Inkling-2-Mini-GGUF/snapshots/abc/mmproj-F16.gguf"
+HF_HUB_CACHE="$TMP/noproj" argv_of inkling-q4
+eq       "missing projector still launches" "$RC" 0
+lacks    "…without --mmproj"                --mmproj
+contains "…and warns"                       "$ERR" "serving text-only"
+# Qwen3.8's own effort set is untouched.
+fails "switch mode still rejects --effort high" ./run.sh 38-q8 --effort high --print
+./run.sh inkling-q4 --effort low --save-defaults --print >/dev/null 2>&1
+contains "save-defaults keeps --effort" "$(cat "$SETTINGS_DIR/inkling-q4.conf" 2>/dev/null)" "--effort low"
+rm -f "$SETTINGS_DIR/inkling-q4.conf"
+# The launch summary names the think mode actually in force.
+argv_of inkling-q4
+contains "summary: effort default"  "$(cat "$TMP/out")" "thinking=effort:template default (high)  vision="
+argv_of inkling-q4 --effort low
+contains "summary: effort level"    "$(cat "$TMP/out")" "thinking=effort:low  vision="
+argv_of flint-q4
+contains "summary: auto unchanged"  "$(cat "$TMP/out")" "thinking=auto  vision="
+excludes "summary: auto has no effort" "$(cat "$TMP/out")" "effort:"
+argv_of 38-q8 --effort low
+contains "summary: switch unchanged" "$(cat "$TMP/out")" "thinking=on(preserve=on,effort=low)  vision="
+
 out="$(./run.sh q8 --ctx 65536 --print 2>/dev/null | norm)"
 contains "--print shows the host command" "$out" "tests/stub-llama-server -m @HUB@/models--unsloth--Qwen3.6-27B-MTP-GGUF/snapshots/abc/Qwen3.6-27B-Q8_0.gguf"
 contains "--print carries the flags"      "$out" "-c 65536"
@@ -198,6 +285,11 @@ contains "docker: image then the same llama-server args" "$out" \
   "ghcr.io/ggml-org/llama.cpp:server-cuda -m @HUB@/models--unsloth--flint-GGUF/snapshots/abc/flint-UD-Q4_K_XL.gguf"
 contains "docker: server binds 0.0.0.0 inside" "$out" "--host 0.0.0.0 --port 18999"
 contains "docker: healthcheck follows the port" "$out" "--health-cmd curl\\ -fsS\\ http://localhost:18999/health"
+# The container is handed the mainline *.gguf_file path as it sits in the cache.
+out="$(dprint inkling-q8 --docker)"
+contains "docker: mainline file path" "$out" \
+  "ghcr.io/ggml-org/llama.cpp:server-cuda -m @HUB@/models--unsloth--Inkling-2-Mini-GGUF/snapshots/abc/Mainline_Support/Inkling-2-Mini-UD-Q8_K_XL.gguf_file"
+contains "docker: inkling alias label" "$out" "--label llm.alias=inkling-2-mini"
 contains "docker: load time is not counted as unhealthy" "$out" "--health-start-period 20m"
 excludes "docker: no host binary in the command" "$out" "stub-llama-server"
 excludes "docker: no -it when printing"   "$out" " -it "
@@ -329,6 +421,15 @@ PATH="$TMP/nohf:/usr/bin:/bin" HF_HUB_CACHE="$TMP/emptyhub" HF_VENV="$TMP/venv2"
 contains "venv hf is used for the download" "$(cat "$TMP/hf.calls")" "download unsloth/flint-GGUF flint-UD-Q4_K_XL.gguf"
 eq       "…without touching python"         "$(cat "$TMP/python.calls")" ""
 
+# A file in a repo subdirectory (Inkling's mainline layout) reaches the hf CLI
+# with that path intact, and the projector is fetched alongside it.
+: > "$TMP/hf.calls"
+PATH="$TMP/nohf:/usr/bin:/bin" HF_HUB_CACHE="$TMP/emptyhub" HF_VENV="$TMP/venv2" \
+  ./fetch-models.sh inkling-q4 >/dev/null 2>&1
+contains "fetch: mainline file by its subdirectory path" "$(cat "$TMP/hf.calls")" \
+  "download unsloth/Inkling-2-Mini-GGUF Mainline_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf_file"
+contains "fetch: projector too" "$(cat "$TMP/hf.calls")" "download unsloth/Inkling-2-Mini-GGUF mmproj-F16.gguf"
+
 # ── deploy.sh ────────────────────────────────────────────────────────────────
 fails "deploy: unknown key"            ./deploy.sh nope
 contains "…says so"                    "$ERR" "unknown model"
@@ -419,6 +520,19 @@ excludes "…never launched"                       "$DCALLS" " -d --restart"
 rm -f "$STUB_DIR/pulled"
 STUB_BUILD=11711 STUB_BUILD_AFTER_PULL=12000 dep flint-q4 --timeout 30
 eq       "old image, pull fixes it: deploys"     "$DRC" 0
+PATH="$TMP/dbin:$PATH" ./deploy.sh stop >/dev/null 2>&1
+
+# The image a Flint deploy left behind (b12429) is too old for Inkling, and
+# below b12611 that model answers with garbage rather than refusing to load.
+rm -f "$STUB_DIR/pulled"
+STUB_BUILD=12429 dep inkling-q4 --timeout 30
+eq       "inkling, old image, pull does not help: exit 1" "$DRC" 1
+contains "…names the floor"                      "$DOUT" "12611"
+excludes "…never launched"                       "$DCALLS" " -d --restart"
+rm -f "$STUB_DIR/pulled"
+STUB_BUILD=12429 STUB_BUILD_AFTER_PULL=12778 dep inkling-q4 --timeout 30
+eq       "inkling, old image, pull fixes it: deploys" "$DRC" 0
+contains "deploy: prints the inkling model id"   "$DOUT" "model id:  inkling-2-mini"
 PATH="$TMP/dbin:$PATH" ./deploy.sh stop >/dev/null 2>&1
 
 STUB_NO_GPU=1 dep flint-q4 --timeout 30

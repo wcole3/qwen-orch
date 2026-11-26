@@ -58,14 +58,19 @@ flags:
   --think                 enable thinking mode (default)
   --no-think              disable thinking mode entirely (also switches to
                           Unsloth's non-thinking sampling: temp 0.7,
-                          top-p 0.8, presence-penalty 1.5)
+                          top-p 0.8, presence-penalty 1.5). Both are refused
+                          by models with no switch: Flint decides per turn,
+                          and Inkling 2 always reasons (use --effort)
   --temp T                sampling temperature, overriding the per-mode default
                           (the table's temp field when thinking — 0.6 Qwen3.6,
                           1.0 Qwen3.8; 0.7 with --no-think)
   --effort low|medium|xhigh
-                          reasoning_effort chat-template kwarg (Qwen3.8 only;
-                          its template defaults to xhigh). Ignored with
-                          --no-think, and by models whose template lacks it
+                          reasoning_effort chat-template kwarg (Qwen3.8; its
+                          template defaults to xhigh). Ignored with
+                          --no-think, and by models whose template lacks it.
+                          Inkling 2 takes none|minimal|low|medium|high|xhigh|
+                          max instead (default high); none lowers reasoning
+                          but does not remove it
   --preserve-thinking     keep prior-turn thinking in the template (default)
   --no-preserve-thinking  drop prior-turn thinking from the template
   --no-vision             skip --mmproj for a vision model — text-only, frees
@@ -109,6 +114,12 @@ flags:
                           (--kv-unified --kv-unified-per-slot N). The setup
                           for several people on one server; also turns on
                           the /metrics endpoint
+  --ubatch N              micro-batch: how many prompt tokens one forward
+                          pass processes (-ub; llama-server's default is
+                          512). Only prompt processing is affected, not
+                          decode speed. Worth lowering for Inkling 2, whose
+                          compute buffer grows with --ctx x this value — at
+                          512 it is three times the size of the KV cache
   --slot-save-path DIR    where slot KV state is saved (created if missing;
                           a relative path resolves against your cwd)
   --cache-reuse N         min chunk size reused from the prompt-prefix cache
@@ -161,6 +172,7 @@ NGL=99
 # slots, KV persistence and cache reuse.
 PARALLEL=""
 SLOT_CTX=""
+UBATCH=""
 SLOT_SAVE_PATH=""
 CACHE_REUSE=""
 LORAS=()
@@ -184,6 +196,14 @@ ALIAS="$(model_info "$MODEL_KEY" alias)"     # "" = llama-server's default id
 # flags to act on; say so rather than silently ignoring them.
 no_think_switch() {
   echo "$1 does not apply: $MODEL_KEY decides per turn whether to reason; there is no thinking switch." >&2
+  exit 1
+}
+
+# Likewise for a template that always reasons at an effort level: an on/off
+# flag would be silently meaningless, and --no-think in particular would start
+# a server that reasons anyway.
+no_effort_switch() {
+  echo "$1 does not apply: $MODEL_KEY always reasons at a reasoning-effort level. Use --effort none for the least reasoning (it lowers reasoning; it does not remove it)." >&2
   exit 1
 }
 
@@ -212,8 +232,10 @@ while [[ $# -gt 0 ]]; do
     --kv)   KV="${2:?--kv needs a value}"; shift 2 ;;
     --mtp)  MTP="${2:?--mtp needs a value}"; MTP_ON=1; shift 2 ;;
     --no-mtp) MTP_ON=0; shift ;;
-    --think)    [[ "$THINK_MODE" == auto ]] && no_think_switch "$1"; THINK=1; shift ;;
-    --no-think) [[ "$THINK_MODE" == auto ]] && no_think_switch "$1"; THINK=0; shift ;;
+    --think)    [[ "$THINK_MODE" == auto ]] && no_think_switch "$1"
+                [[ "$THINK_MODE" == effort ]] && no_effort_switch "$1"; THINK=1; shift ;;
+    --no-think) [[ "$THINK_MODE" == auto ]] && no_think_switch "$1"
+                [[ "$THINK_MODE" == effort ]] && no_effort_switch "$1"; THINK=0; shift ;;
     --temp) TEMP="${2:?--temp needs a value}"; shift 2 ;;
     --effort)   [[ "$THINK_MODE" == auto ]] && no_think_switch "$1"
                 EFFORT="${2:?--effort needs a value}"; shift 2 ;;
@@ -225,6 +247,7 @@ while [[ $# -gt 0 ]]; do
     --ngl) NGL="${2:?--ngl needs a value}"; shift 2 ;;
     --parallel) PARALLEL="${2:?--parallel needs a value}"; shift 2 ;;
     --slot-ctx) SLOT_CTX="${2:?--slot-ctx needs a value}"; shift 2 ;;
+    --ubatch) UBATCH="${2:?--ubatch needs a value}"; shift 2 ;;
     --api-key) API_KEY_ARG="${2:?--api-key needs a value}"; shift 2 ;;
     --print|--dry-run) PRINT_ONLY=1; shift ;;
     --docker) DOCKER=1; shift ;;
@@ -301,7 +324,14 @@ fi
 
 # The Qwen3.8 template raises on anything outside this set, and a bad value only
 # surfaces as a 500 on the first request — reject it here instead.
-if [[ -n "$EFFORT" ]]; then
+if [[ -n "$EFFORT" && "$THINK_MODE" == effort ]]; then
+  # Inkling 2's template takes these names (it also takes a number in
+  # 0.0-0.99, which this script does not wrap — use EXTRA_ARGS for that).
+  case "$EFFORT" in
+    none|minimal|low|medium|high|xhigh|max) ;;
+    *) echo "--effort must be one of none, minimal, low, medium, high, xhigh, max (got: $EFFORT)" >&2; exit 1 ;;
+  esac
+elif [[ -n "$EFFORT" ]]; then
   case "$EFFORT" in
     low|medium|xhigh) ;;
     none) echo "--effort none is not a template value: use --no-think." >&2; exit 1 ;;
@@ -311,7 +341,7 @@ fi
 
 # Numeric passthroughs: catch a typo here, not as a llama-server usage error
 # thirty seconds into loading the weights.
-for _pair in "ngl:$NGL" "parallel:$PARALLEL" "cache-reuse:$CACHE_REUSE" "slot-ctx:$SLOT_CTX"; do
+for _pair in "ngl:$NGL" "parallel:$PARALLEL" "cache-reuse:$CACHE_REUSE" "slot-ctx:$SLOT_CTX" "ubatch:$UBATCH"; do
   _name="${_pair%%:*}"; _val="${_pair#*:}"
   if [[ -n "$_val" && ! "$_val" =~ ^[0-9]+$ ]]; then
     echo "--$_name must be a non-negative integer (got: $_val)" >&2; exit 1
@@ -320,6 +350,9 @@ done
 unset _pair _name _val
 if [[ -n "$SLOT_CTX" ]] && (( SLOT_CTX < 1 )); then
   echo "--slot-ctx must be a positive integer (got: $SLOT_CTX)" >&2; exit 1
+fi
+if [[ -n "$UBATCH" ]] && (( UBATCH < 1 )); then
+  echo "--ubatch must be a positive integer (got: $UBATCH)" >&2; exit 1
 fi
 
 # A relative --slot-save-path is relative to the caller's cwd; this script has
@@ -367,6 +400,7 @@ if (( SAVE_DEFAULTS )); then
   if (( NGL != 99 ));        then SAVED+=(--ngl "$NGL"); fi
   if [[ -n "$PARALLEL" ]];   then SAVED+=(--parallel "$PARALLEL"); fi
   if [[ -n "$SLOT_CTX" ]];   then SAVED+=(--slot-ctx "$SLOT_CTX"); fi
+  if [[ -n "$UBATCH" ]];     then SAVED+=(--ubatch "$UBATCH"); fi
   if [[ -n "$CACHE_REUSE" ]]; then SAVED+=(--cache-reuse "$CACHE_REUSE"); fi
   # Already absolute by here, so the saved line means the same thing next time
   # no matter which directory that launch is started from.
@@ -392,6 +426,7 @@ ARGS=(
 # from running past the model's trained context. /metrics rides along because
 # this is the several-users configuration, where load is worth watching.
 [[ -n "$SLOT_CTX" ]] && ARGS+=(--kv-unified --kv-unified-per-slot "$SLOT_CTX" --metrics)
+[[ -n "$UBATCH" ]] && ARGS+=(-ub "$UBATCH")
 [[ -n "$ALIAS" ]] && ARGS+=(--alias "$ALIAS")
 [[ -n "$CACHE_REUSE" ]] && ARGS+=(--cache-reuse "$CACHE_REUSE")
 # llama-server does not create the slot directory itself — it fails at startup
@@ -450,6 +485,11 @@ if [[ "$SAMPLING" == google ]]; then
   # Google's Gemma 4 recommendation, which does not change with thinking mode.
   ARGS+=(--temp "${TEMP:-$TEMP_THINK}" --top-p 0.95 --top-k 64 --min-p 0.0
          --presence-penalty 0.0 --repeat-penalty 1.0)
+elif [[ "$SAMPLING" == plain ]]; then
+  # Thinking Machines' Inkling 2 recommendation: the temperature and nothing
+  # else — no nucleus, no top-k (0 disables it), no penalties.
+  ARGS+=(--temp "${TEMP:-$TEMP_THINK}" --top-p 1.0 --top-k 0 --min-p 0.0
+         --presence-penalty 0.0 --repeat-penalty 1.0)
 elif (( THINK )); then
   # Unsloth-recommended sampling for coding, thinking mode. The temperature is
   # per-model (the table's temp field: 0.6 for Qwen3.6, 1.0 for Qwen3.8).
@@ -466,6 +506,12 @@ if [[ "$THINK_MODE" == auto ]]; then
   # --reasoning on would have the parser assume every turn opens inside a
   # reasoning block, which this kind of model does not do.
   :
+elif [[ "$THINK_MODE" == effort ]]; then
+  # The template writes a thinking-effort line on every request and has no
+  # enable_thinking or preserve key, so the only thing to send is the level.
+  # Unset leaves the template's own default (0.9, which it calls high). A
+  # request that carries its own reasoning_effort overrides this.
+  [[ -n "$EFFORT" ]] && ARGS+=(--chat-template-kwargs "{\"reasoning_effort\":\"$EFFORT\"}")
 elif (( THINK )); then
   ARGS+=(--reasoning on)
   if (( PRESERVE )); then ARGS+=(--reasoning-preserve)
@@ -653,7 +699,14 @@ if [[ -n "$MMPROJ" ]]; then
     fi
   else                           VISION_STATE="off(not downloaded)"; fi
 fi
-echo "Launching [$MODEL_KEY]  ctx=$CTX  kv=$KV  mtp=$([[ $MTP_ON == 1 ]] && echo "$MTP" || echo off)  thinking=$([[ $THINK_MODE == auto ]] && echo auto || { [[ $THINK == 1 ]] && echo "on(preserve=$([[ $PRESERVE == 1 ]] && echo on || echo off)${EFFORT:+,effort=$EFFORT})" || echo off; })  vision=$VISION_STATE:"
+case "$THINK_MODE" in
+  auto)   THINK_STATE=auto ;;
+  effort) THINK_STATE="effort:${EFFORT:-template default (high)}" ;;
+  *) if (( THINK )); then
+       THINK_STATE="on(preserve=$( (( PRESERVE )) && echo on || echo off)${EFFORT:+,effort=$EFFORT})"
+     else THINK_STATE=off; fi ;;
+esac
+echo "Launching [$MODEL_KEY]  ctx=$CTX  kv=$KV  mtp=$([[ $MTP_ON == 1 ]] && echo "$MTP" || echo off)  thinking=$THINK_STATE  vision=$VISION_STATE:"
 printf '  %q' "${LAUNCH[@]}"; echo
 echo
 exec "${LAUNCH[@]}"

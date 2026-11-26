@@ -31,7 +31,7 @@ fi
 # container); HF_HUB_CACHE is its hub/ subdirectory, where the repos sit as
 # models--<org>--<name>/snapshots/<commit>/. Both follow huggingface_hub's own
 # precedence, so an HF_HOME or HF_HUB_CACHE already in your environment wins.
-# ~480 GiB to hold every entry in the table at once; each entry's own
+# ~520 GiB to hold every entry in the table at once; each entry's own
 # requirement is its `disk` field, and ./fetch-models.sh checks the free space
 # before it downloads anything.
 HF_CACHE="${HF_CACHE:-${HF_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/huggingface}}"
@@ -96,13 +96,18 @@ export SGLANG_IMAGE SGLANG_PORT SGLANG_CONTAINER
 #              rather than in args because it is mode-specific: --no-think
 #              always uses 0.7, which every Qwen generation agrees on.
 #   sampling — sampler family run.sh applies: qwen (default; top-k 20, and
-#              Qwen's separate non-thinking sampler) or google (Gemma 4's
-#              temp 1.0 / top-p 0.95 / top-k 64, the same in both modes).
+#              Qwen's separate non-thinking sampler), google (Gemma 4's
+#              temp 1.0 / top-p 0.95 / top-k 64, the same in both modes) or
+#              plain (the table's temp with no truncation: top-p 1.0, top-k 0
+#              — Inkling 2).
 #   think    — how thinking is controlled: switch (default; the template has
 #              an on/off switch, driven by run.sh --think/--no-think) or auto
 #              (the model decides per turn and there is nothing to switch, so
 #              run.sh passes no --reasoning flag and refuses --no-think and
-#              --effort). Flint is auto.
+#              --effort). Flint is auto. Or effort (the template always
+#              reasons, at a reasoning_effort level, and has no switch:
+#              run.sh --effort sets the level and --think/--no-think are
+#              refused). Inkling 2 is effort.
 #   alias    — model id clients send (llama-server --alias), or "" to leave
 #              llama-server's default, the file path. Set on the shared,
 #              multi-user entries so a team has one stable name per model.
@@ -131,7 +136,7 @@ export SGLANG_IMAGE SGLANG_PORT SGLANG_CONTAINER
 # projector) downloads once.
 MODEL_KEYS=(nvfp4 nvfp4-attn q8 bf16 hauhau huihui aeon deckard nvfp4-unsloth
             38-q8 38-bf16 38-huihui 38-nvfp4 g4-heretic g4-huihui
-            flint-q4 flint-nvfp4)
+            flint-q4 flint-nvfp4 inkling-q4 inkling-q8)
 
 model_info() {
   local key="$1" field="$2"
@@ -328,6 +333,59 @@ model_info() {
       size="23 GB"; disk=22; vram=40700; temp=1.0; think=auto; alias=flint   # measured ~40,650 MiB over baseline, b12429, RTX PRO 6000
       args="--no-mtp --parallel 8 --ctx 655360 --slot-ctx 131072"
       desc="Flint NVFP4 (Recursive QAT) — 8 slots, shared KV pool; tested on Blackwell only" ;;
+    # ── Thinking Machines Inkling 2 Mini (26B-A5.4B) ─────────────────────────
+    # GGUF arch `inkling2_loop`: 26B-parameter MoE, 128 experts with 8 routed
+    # per token, text and image in. Layers 6-17 of its 24 run three passes per
+    # token with shared weights, so a token costs 48 layer visits and ~5.4B
+    # active parameters.
+    # These are the Mainline_Support/ files of the Unsloth repo — the only
+    # layout mainline llama.cpp reads (the root files are for Unsloth's fork),
+    # named *.gguf_file on purpose upstream. llama-server loads them by path as
+    # they are; nothing is renamed in the cache.
+    # Needs llama.cpp >= b12611 (ggml-org/llama.cpp#32704). An older build does
+    # not refuse the model: it drops the per-expert NVFP4 scales on the second
+    # and third loop passes and answers with garbage (perplexity ~130 instead
+    # of 7.65), so the minbuild check is what stands between a stale image and
+    # a server that looks healthy and is not.
+    # llama.cpp is the only engine here that runs it on Ampere: SGLang's and
+    # vLLM's Inkling 2 kernels support Hopper and Blackwell only, so the SGLang
+    # cookbook recipe does not apply to an A40.
+    # No MTP head, hence --no-mtp. DSpark speculative decoding is merged
+    # upstream (#32218) but left out: Unsloth measured 1.03x at temperature
+    # 1.0 with the mainline drafter, and 1.0 is the recommended temperature.
+    # Thinking Machines' sampling is temp 1.0 with no truncation (sampling=
+    # plain). The template always reasons at a reasoning_effort level and has
+    # no switch (think=effort).
+    # Team defaults like Flint's: 8 slots on one shared KV pool. The pool is
+    # smaller than Flint's and --ubatch is set, because this architecture's
+    # memory is not mostly KV. Measured (b12774, RTX PRO 6000):
+    #   VRAM MiB ~= 19,300 + pool x (31.7 KB + 200 B x ubatch)        [q4]
+    # 8 of the 48 layer visits keep KV for the whole sequence (31 KiB/token);
+    # the other 40 use a 1,024-token window (1.4 GiB, fixed). The rest is the
+    # compute buffer: llama.cpp reserves a relative-bias table of pool x ubatch
+    # cells for each of the 48 visits. At llama-server's default ubatch of 512
+    # that is 100 KB per pool token — three times the KV — and Flint's 655k
+    # pool would need 100 GB. At 64 it is 13 KB, for ~24% slower processing of
+    # a single long prompt (849 -> 644 tokens/s) and no change in decode speed.
+    inkling-q4)
+      repo=unsloth/Inkling-2-Mini-GGUF
+      file=Mainline_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf_file
+      mmproj=mmproj-F16.gguf
+      fmt=gguf; minbuild=12611
+      size="17.6 GB"; disk=17; vram=41800; temp=1.0; sampling=plain; think=effort; alias=inkling-2-mini   # measured 41,811 MiB over baseline, b12774, RTX PRO 6000
+      args="--no-mtp --parallel 8 --ctx 524288 --slot-ctx 131072 --ubatch 64"
+      desc="Inkling 2 Mini 26B-A5.4B looped MoE UD-Q4_K_XL + vision — 8 slots, shared KV pool, ./deploy.sh" ;;
+    # The reference quant: original NVFP4 experts, everything else BF16. Every
+    # other quant in the repo is scored against this one. Its weights are
+    # 5 GiB larger, so the pool is 393,216 (8 x 49,152) to stay inside 48 GB.
+    inkling-q8)
+      repo=unsloth/Inkling-2-Mini-GGUF
+      file=Mainline_Support/Inkling-2-Mini-UD-Q8_K_XL.gguf_file
+      mmproj=mmproj-F16.gguf
+      fmt=gguf; minbuild=12611
+      size="22.9 GB"; disk=22; vram=40300; temp=1.0; sampling=plain; think=effort; alias=inkling-2-mini   # measured 40,257 MiB over baseline, b12774, RTX PRO 6000
+      args="--no-mtp --parallel 8 --ctx 393216 --slot-ctx 131072 --ubatch 64"
+      desc="Inkling 2 Mini UD-Q8_K_XL + vision — lossless reference; 8 slots, shared KV pool, ./deploy.sh" ;;
     *) return 1 ;;
   esac
   [[ -z "$path" && "$fmt" == gguf ]] && path="$file"

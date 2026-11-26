@@ -4,7 +4,7 @@
 #   ./fetch-models.sh                # show the menu (with download status)
 #   ./fetch-models.sh nvfp4          # fetch one model
 #   ./fetch-models.sh q8 bf16        # fetch several
-#   ./fetch-models.sh all            # fetch everything (~480 GiB)
+#   ./fetch-models.sh all            # fetch everything (~520 GiB)
 #
 # Files land in the standard HuggingFace cache, $HF_HUB_CACHE (see env.sh).
 # Already-present files are skipped, and the free space is checked against what
@@ -29,7 +29,7 @@ menu() {
   echo
   echo "Downloads go to: $HF_HUB_CACHE"
   echo "Free disk space: $(free_gib 2>/dev/null || echo '?') GiB"
-  echo "Everything at once needs ~480 GiB; the disk column is per model."
+  echo "Everything at once needs ~520 GiB; the disk column is per model."
 }
 
 if [[ $# -eq 0 || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
